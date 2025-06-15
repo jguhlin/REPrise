@@ -1,4 +1,6 @@
 use clap::Parser;
+use reprise::build_sequence;
+use reprise::suffix_array;
 
 /// Normalize single-hyphen long options (e.g. `-input`) to clap style `--input`.
 fn normalize_args() -> Vec<String> {
@@ -99,4 +101,12 @@ struct Cli {
 fn main() {
     let args = Cli::parse_from(normalize_args());
     println!("{:#?}", args);
+
+    // Build sequence from the input FASTA file.
+    let data = build_sequence(&args.input).expect("failed to read FASTA");
+    println!("sequence length: {}", data.sequence.len());
+
+    // Construct suffix array using the Rust implementation.
+    let sa = suffix_array(&data.sequence);
+    println!("suffix array length: {}", sa.len());
 }
