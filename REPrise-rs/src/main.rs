@@ -109,4 +109,24 @@ fn main() {
     // Construct suffix array using the Rust implementation.
     let sa = suffix_array(&data.sequence);
     println!("suffix array length: {}", sa.len());
+
+    // Demo of the newly ported routines
+    let k = args.k.unwrap_or(4) as usize;
+    let cache = reprise::alg::repeat::store_cache(0, k, &data.sequence, &sa);
+    let mut kmers = reprise::alg::repeat::build_sortedkmers(
+        k,
+        &data.sequence,
+        &cache,
+        &sa,
+        args.minfreq.unwrap_or(1) as usize,
+    );
+    println!("top kmer freq: {:?}", kmers.peek());
+    let families = reprise::alg::repeat::build_repeat_families(
+        kmers,
+        &data.sequence,
+        &cache,
+        &sa,
+        args.minfreq.unwrap_or(1) as usize,
+    );
+    println!("repeat families detected: {}", families.len());
 }
