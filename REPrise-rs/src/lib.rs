@@ -75,6 +75,99 @@ pub fn suffix_array(seq: &[u8]) -> Vec<i64> {
     sa
 }
 
+/// Convert numeric nucleotide code to character (mirrors C++ num_to_char).
+pub fn num_to_char(z: u8) -> char {
+    match z {
+        0 => 'A',
+        1 => 'C', 
+        2 => 'G',
+        3 => 'T',
+        _ => 'N',
+    }
+}
+
+/// Get complement of nucleotide (mirrors C++ complement).
+pub fn complement(c: u8) -> u8 {
+    match c {
+        0 => 3, // A -> T
+        1 => 2, // C -> G  
+        2 => 1, // G -> C
+        3 => 0, // T -> A
+        _ => 99, // Invalid -> N
+    }
+}
+
+/// Get reverse complement of sequence (mirrors C++ reverse_complement).
+pub fn reverse_complement(query: &[u8]) -> Vec<u8> {
+    query.iter().rev().map(|&b| complement(b)).collect()
+}
+
+/// Compute entropy of k-mer (mirrors C++ compute_entropy).
+pub fn compute_entropy(kmer: &[u8]) -> f64 {
+    let mut count = [0; 4];
+    for &base in kmer {
+        if base <= 3 {
+            count[base as usize] += 1;
+        }
+    }
+    
+    let mut answer = 0.0;
+    let k = kmer.len() as f64;
+    for &cnt in &count {
+        if cnt > 0 {
+            let y = cnt as f64 / k;
+            answer += y * y.ln();
+        }
+    }
+    answer
+}
+
+/// Map absolute sequence position to chromosome name and offset (mirrors C++ chrtracer).
+pub fn chrtracer(chrtable: &[(String, usize)], stringpos: usize) -> (String, usize) {
+    let mut result = &chrtable[chrtable.len() - 1];
+    for entry in chrtable {
+        if stringpos < entry.1 {
+            // Found first entry with start > pos, so use previous entry
+            let idx = chrtable.iter().position(|x| x.1 == entry.1).unwrap();
+            if idx > 0 {
+                result = &chrtable[idx - 1];
+            }
+            break;
+        }
+        result = entry;
+    }
+    (result.0.clone(), result.1)
+}
+
+/// Calculate default k-mer length (mirrors C++ default_k).
+pub fn default_k(len: usize, kmer_dist: usize) -> usize {
+    // Build Pascal's triangle for combinations
+    let mut v = vec![vec![0i64; 40]; 40];
+    for i in 0..v.len() {
+        v[i][0] = 1;
+        v[i][i] = 1;
+    }
+    for kk in 1..v.len() {
+        for j in 1..kk {
+            v[kk][j] = v[kk-1][j-1] + v[kk-1][j];
+        }
+    }
+
+    for l in 2..=40 {
+        let mut comb = 0.0;
+        for d in 0..=kmer_dist {
+            if d < v[l].len() {
+                comb += v[l][d] as f64 * 3.0_f64.powi(d as i32);
+            }
+        }
+        let e = len as f64 * comb / 4.0_f64.powi(l as i32);
+        if e < 1.0 {
+            return l + 1;
+        }
+    }
+    41
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

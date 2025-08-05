@@ -20,6 +20,7 @@ Author: Atsushi Takeda, Daisuke Nonaka
 
 using namespace std;
 
+#include "cmd_line_opts.h"
 #include "sais_long.h"
 #include "REPrise.hpp"
 

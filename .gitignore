@@ -1,4 +1,41 @@
 REPrise
+eq_cpp
 test/tst_gen.py
+
+# Original output patterns
 out.freq
 out.reprof
+
+# Test data and outputs
+data/
+*.fasta
+*.fa
+
+# C++ test outputs
+*_cpp.freq
+*_cpp.reprof
+*_cpp.masked
+*_cpp.bed
+
+# Rust test outputs  
+*_rust.freq
+*_rust.reprof
+*_rust.masked
+*_rust.bed
+
+# General test outputs
+test_*.tsv
+test_*.reprof
+test_*.freq
+final_test.tsv
+
+# Comparison and debug files
+cpp_output.json
+rust_output.json
+cpp_out.json
+rust_out.json
+equivalence_report.md
+
+# Rust build artifacts
+REPrise-rs/target/
+REPrise-rs/Cargo.lock
