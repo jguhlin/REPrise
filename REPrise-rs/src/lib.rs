@@ -68,11 +68,19 @@ pub fn build_sequence<P: AsRef<Path>>(path: P) -> io::Result<SequenceData> {
     Ok(SequenceData { sequence, chrtable })
 }
 
-/// Very simple (and slow) suffix array implementation used for testing.
+/// Fast suffix array implementation using suffix crate (SAIS algorithm).
 pub fn suffix_array(seq: &[u8]) -> Vec<i64> {
-    let mut sa: Vec<i64> = (0..seq.len() as i64).collect();
-    sa.sort_by(|&a, &b| seq[a as usize..].cmp(&seq[b as usize..]));
-    sa
+    use suffix::SuffixTable;
+    
+    // Convert byte sequence to string - this is safe for nucleotide sequences
+    // which only contain values 0-3 (and padding values)
+    let text = String::from_utf8_lossy(seq);
+    
+    // Create suffix table using SAIS algorithm
+    let table = SuffixTable::new(text);
+    
+    // Convert to our expected format (Vec<i64>)
+    table.table().iter().map(|&x| x as i64).collect()
 }
 
 /// Convert numeric nucleotide code to character (mirrors C++ num_to_char).
@@ -122,24 +130,21 @@ pub fn compute_entropy(kmer: &[u8]) -> f64 {
     answer
 }
 
-/// Map absolute sequence position to chromosome name and offset (mirrors C++ chrtracer).
-pub fn chrtracer(chrtable: &[(String, usize)], stringpos: usize) -> (String, usize) {
-    let mut result = &chrtable[chrtable.len() - 1];
-    for entry in chrtable {
-        if stringpos < entry.1 {
-            // Found first entry with start > pos, so use previous entry
-            let idx = chrtable.iter().position(|x| x.1 == entry.1).unwrap();
-            if idx > 0 {
-                result = &chrtable[idx - 1];
-            }
-            break;
+/// Trace chromosome information for a position (mirrors C++ chrtracer)
+/// Returns (chromosome_name, chromosome_start_position)
+pub fn chrtracer(pos: usize, chrtable: &[(String, usize)]) -> (String, usize) {
+    // Find the chromosome this position belongs to by searching backwards
+    for i in (0..chrtable.len()).rev() {
+        if pos >= chrtable[i].1 {
+            return (chrtable[i].0.clone(), chrtable[i].1);
         }
-        result = entry;
     }
-    (result.0.clone(), result.1)
+    // Default to unknown if position is before any chromosome
+    ("unknown".to_string(), 0)
 }
 
 /// Calculate default k-mer length (mirrors C++ default_k).
+
 pub fn default_k(len: usize, kmer_dist: usize) -> usize {
     // Build Pascal's triangle for combinations
     let mut v = vec![vec![0i64; 40]; 40];

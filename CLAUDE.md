@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 REPrise is a de novo interspersed repeat detection tool using inexact seeding. This repository contains:
 
-1. **Original C++ implementation** (`REPrise.cpp`, `REPrise.hpp`) - The reference implementation
+1. **Original C++ implementation** (`REPrise.cpp`, `REPrise.hpp`) - The reference implementation. *Make no changes to this code.*
 2. **Rust port** (`REPrise-rs/`) - A 1:1 parity port of the C++ implementation with additional CLI interface
 3. **Evaluation and testing tools** - JSON-based equivalence testing between C++ and Rust versions
 

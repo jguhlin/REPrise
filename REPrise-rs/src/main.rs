@@ -1,7 +1,7 @@
 use std::env;
 use std::fs::File;
 use std::io::{self, Write};
-use reprise::{build_sequence, suffix_array, reverse_complement, num_to_char, default_k};
+use reprise::{build_sequence, suffix_array, num_to_char, default_k, chrtracer};
 
 /// CLI args matching C++ REPrise parameters.
 #[derive(Debug)]
@@ -24,7 +24,11 @@ struct Cli {
     min_improvement: usize,
     tandem_dist: usize,
     verbose: bool,
+    #[allow(dead_code)]
     help: bool,
+    additional_file: bool,
+    #[allow(dead_code)]
+    parallel_num: usize,
 }
 
 fn parse_cli() -> Cli {
@@ -48,6 +52,8 @@ fn parse_cli() -> Cli {
     let mut tandem_dist: usize = 500;
     let mut verbose = false;
     let mut help = false;
+    let mut additional_file = false;
+    let mut parallel_num: usize = 1;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -106,6 +112,10 @@ fn parse_cli() -> Cli {
             }
             "-verbose" => { verbose = true; i += 1; }
             "-h" => { help = true; i += 1; }
+            "-additionalfile" => { additional_file = true; i += 1; }
+            "-pa" => {
+                if i + 1 < args.len() { parallel_num = args[i + 1].parse().unwrap_or(parallel_num); i += 2; } else { break; }
+            }
             _ => { i += 1; }
         }
     }
@@ -124,7 +134,7 @@ fn parse_cli() -> Cli {
     Cli { 
         input, output, k, match_score, mismatch_score, gap_score, gap_extend_score,
         cap_penalty, dist, max_extend, max_repeat, max_gap, stop_after, min_length,
-        min_freq, min_improvement, tandem_dist, verbose, help
+        min_freq, min_improvement, tandem_dist, verbose, help, additional_file, parallel_num
     }
 }
 
@@ -143,6 +153,7 @@ fn print_usage() {
     println!("(Optional)");
     println!("   -h                  Print help and exit");
     println!("   -verbose            Verbose");
+    println!("   -additionalfile     Output files about masked region(.masked and .bed)");
     println!();
     println!("   -match INT          Match score of the extension alignment (default = 1)");
     println!("   -mismatch INT       Mismatch score of the extension alignment (default = -1)");
@@ -159,10 +170,12 @@ fn print_usage() {
     println!("   -minfreq INT        Minimum number of elements  belonging to one repeat family (default = 3)");
     println!("   -minimprovement INT Penalty associated with the number of regions to be extended as the repeat regions (default = 3)");
     println!("   -tandemdist INT     Interval to match the same seed to avoid seed matching with tandem repeats(default = 500)");
+    println!("   -pa INT             Number of parallel threads (default = 1)");
     println!();
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct RepeatHit {
     contig_id: String,
     start: usize,
@@ -203,14 +216,19 @@ fn main() -> io::Result<()> {
         println!("suffix array length: {}", sa.len());
     }
     
-    // Store cache with edit distance 0 for exact matching
-    let cache = reprise::alg::repeat::store_cache(0, k, &data.sequence, &sa);
+    // Store cache with proper inexact seeding support like C++
+    let dist0_cache = reprise::alg::repeat::store_cache(0, k, &data.sequence, &sa);
+    let inexact_cache = if args.dist > 0 {
+        reprise::alg::repeat::store_cache(args.dist as u8, k, &data.sequence, &sa)
+    } else {
+        dist0_cache.clone()
+    };
 
-    // Build kmers heap and iterate families as a proxy for repeats.
+    // Build kmers heap using exact cache for frequency counting
     let mut kmers = reprise::alg::repeat::build_sortedkmers(
         k,
         &data.sequence,
-        &cache,
+        &dist0_cache,
         &sa,
         args.min_freq,
     );
@@ -218,50 +236,252 @@ fn main() -> io::Result<()> {
     // Global mask across genome during family discovery.
     let mut mask = vec![false; data.sequence.len()];
 
-    // For now, create a simple output file matching C++ .reprof format
+    // Create output files matching C++ format
     let reprof_file = format!("{}.reprof", args.output);
     let mut reprof_writer = File::create(reprof_file)?;
     
+    let freq_file = format!("{}.freq", args.output);
+    let mut freq_writer = File::create(freq_file)?;
+    
+    // Create BED and masked files if requested
+    let mut bed_writer = if args.additional_file {
+        let bed_file = format!("{}.bed", args.output);
+        Some(File::create(bed_file)?)
+    } else {
+        None
+    };
+    
+    let mut masked_writer = if args.additional_file {
+        let masked_file = format!("{}.masked", args.output);
+        Some(File::create(masked_file)?)
+    } else {
+        None
+    };
+    
     let mut repeat_num = 0;
     
-    // Process repeat families (simplified version for now)
-    while let Some((freq, kmer)) = kmers.pop() {
-        if freq < args.min_freq { break; }
-        if repeat_num >= args.max_repeat { break; }
-
-        // Forward occurrences
-        let mut occ_f = reprise::alg::repeat::findkmer(&kmer, &cache, &data.sequence, &sa);
-        reprise::alg::repeat::removetandem(&mut occ_f, args.tandem_dist);
-        reprise::alg::repeat::removemasked(&mut occ_f, &mask, k, false);
-
-        // Reverse complement occurrences
-        let rc_kmer = reverse_complement(&kmer);
-        let mut occ_r = reprise::alg::repeat::findkmer(&rc_kmer, &cache, &data.sequence, &sa);
-        reprise::alg::repeat::removetandem(&mut occ_r, args.tandem_dist);
-        reprise::alg::repeat::removemasked(&mut occ_r, &mask, k, true);
-
-        let total_freq = occ_f.len() + occ_r.len();
-        if total_freq < args.min_freq { continue; }
-
-        // Mask the used positions
-        reprise::alg::repeat::maskbyseed(&occ_f, &mut mask, k, false);
-        reprise::alg::repeat::maskbyseed(&occ_r, &mut mask, k, true);
-
-        // Create a simple consensus sequence (just the seed for now)
-        write!(reprof_writer, ">R={}, seedfreq={}, elementfreq={}, length={}, Seed=", 
-               repeat_num, freq, total_freq, k)?;
-        for &base in &kmer {
-            write!(reprof_writer, "{}", num_to_char(base))?;
+    // Process repeat families using find_bestseed like C++ version with full extension alignment
+    while repeat_num < args.max_repeat {
+        if kmers.is_empty() {
+            break;
         }
-        writeln!(reprof_writer)?;
         
-        // Write the consensus (just the seed sequence for now)
-        for &base in &kmer {
-            write!(reprof_writer, "{}", num_to_char(base))?;
+        // Use find_bestseed with inexact cache for repeat detection
+        let (seedfreq, kmer, pos, rev) = reprise::alg::repeat::find_bestseed(
+            &mut kmers, &inexact_cache, &mask, &data.sequence, &sa, args.tandem_dist, args.min_freq
+        );
+        
+        if seedfreq < args.min_freq {
+            break;
         }
-        writeln!(reprof_writer)?;
 
-        repeat_num += 1;
+        // Immediately mask the seed positions to prevent overlapping k-mers
+        // This is critical for matching C++ behavior
+        let mut seed_occ_f = Vec::new();
+        let mut seed_occ_r = Vec::new();
+        for (i, &position) in pos.iter().enumerate() {
+            if !rev[i] {
+                seed_occ_f.push(position);
+            } else {
+                seed_occ_r.push(position);
+            }
+        }
+        reprise::alg::repeat::maskbyseed(&seed_occ_f, &mut mask, k, false);
+        reprise::alg::repeat::maskbyseed(&seed_occ_r, &mut mask, k, true);
+
+        // Create consensus sequence with extension alignment
+        let consensus_size = 2 * args.max_extend + k;
+        let mut consensus = vec![0u8; consensus_size];
+        
+        // Initialize consensus with the seed sequence at MAXEXTEND position
+        for (i, &base) in kmer.iter().enumerate() {
+            if args.max_extend + i < consensus.len() {
+                consensus[args.max_extend + i] = base;
+            }
+        }
+        
+        // Perform extension alignment in both directions
+        let mut repeatstart = vec![0i32; seedfreq];
+        let mut repeatend = vec![0i32; seedfreq];
+        let mut seed_ext = vec![-1i32; seedfreq];
+        
+        // Right extension
+        let right_ext = reprise::alg::repeat::extend(
+            true, // is_right
+            seedfreq,
+            &pos,
+            &rev,
+            &data.sequence,
+            &mut consensus,
+            &mut seed_ext,
+            args.match_score,
+            args.mismatch_score,
+            args.gap_score,
+            args.gap_extend_score,
+            args.cap_penalty,
+            args.max_extend,
+            args.max_gap,
+            args.stop_after,
+            k,
+            args.min_improvement as i32,
+        );
+        
+        // Update seed_ext for right extension
+        for i in 0..seedfreq {
+            repeatend[i] = seed_ext[i];
+        }
+        
+        // Reset seed_ext for left extension
+        seed_ext.fill(-1);
+        
+        // Left extension  
+        let left_ext = reprise::alg::repeat::extend(
+            false, // is_right
+            seedfreq,
+            &pos,
+            &rev,
+            &data.sequence,
+            &mut consensus,
+            &mut seed_ext,
+            args.match_score,
+            args.mismatch_score,
+            args.gap_score,
+            args.gap_extend_score,
+            args.cap_penalty,
+            args.max_extend,
+            args.max_gap,
+            args.stop_after,
+            k,
+            args.min_improvement as i32,
+        );
+        
+        // Update seed_ext for left extension
+        for i in 0..seedfreq {
+            repeatstart[i] = -seed_ext[i] - 1;
+        }
+        
+        // Calculate consensus boundaries  
+        let consensusstart = args.max_extend.saturating_sub(left_ext.max(0) as usize);
+        let consensusend = args.max_extend + k - 1 + right_ext.max(0) as usize;
+        let consensus_length = consensusend.saturating_sub(consensusstart) + 1;
+        
+        // Only create repeat family if it meets minimum length requirement
+        if consensus_length >= args.min_length {
+            let mut element_count = 0;
+            
+            // Perform masking alignment for each occurrence
+            for i in 0..seedfreq {
+                let (elementstart, elementend) = reprise::alg::repeat::masking_align(
+                    i,
+                    consensusstart,
+                    consensusend,
+                    &consensus,
+                    &data.sequence,
+                    pos[i],
+                    k,
+                    rev[i],
+                    args.match_score,
+                    args.mismatch_score,
+                    args.gap_score,
+                    args.gap_extend_score,
+                    args.max_extend,
+                    args.stop_after,
+                );
+                
+                // Check if element meets minimum length
+                if (elementend - elementstart + 1).abs() >= args.min_length as isize {
+                    element_count += 1;
+                    
+                    // Write to BED file if requested
+                    if let Some(ref mut bed) = bed_writer {
+                        let element_pos = pos[i];
+                        let (chr_name, chr_offset) = chrtracer(element_pos, &data.chrtable);
+                        let bed_start = element_pos + elementstart.max(0) as usize - chr_offset;
+                        let bed_end = element_pos + elementend.max(0) as usize - chr_offset;
+                        let element_length = (elementend - elementstart + 1).abs();
+                        let strand = if rev[i] { "-" } else { "+" };
+                        writeln!(bed, "{}\t{}\t{}\tR={}\t{}\t{}", 
+                            chr_name, bed_start, bed_end, repeat_num, element_length, strand)?;
+                    }
+                    
+                    // Mask the element
+                    reprise::alg::repeat::maskbyrepeat_element(i, elementstart.max(0) as usize, elementend.max(0) as usize, &mut mask, &pos);
+                }
+            }
+            
+            // Only output if we have valid elements
+            if element_count > 0 {
+                // Create consensus sequence output
+                write!(reprof_writer, ">R={}, seedfreq={}, elementfreq={}, length={}, Seed=", 
+                       repeat_num, seedfreq, element_count, consensus_length)?;
+                for &base in &kmer {
+                    write!(reprof_writer, "{}", num_to_char(base))?;
+                }
+                writeln!(reprof_writer)?;
+                
+                // Write the extended consensus sequence
+                for i in consensusstart..=consensusend {
+                    write!(reprof_writer, "{}", num_to_char(consensus[i]))?;
+                    if (i - consensusstart + 1) % 80 == 0 {
+                        writeln!(reprof_writer)?;
+                    }
+                }
+                if (consensusend - consensusstart + 1) % 80 != 0 {
+                    writeln!(reprof_writer)?;
+                }
+                
+                // Write to freq file (format: repeat_id \t seedfreq \t element_count)
+                writeln!(freq_writer, "R={}\t{}\t{}", repeat_num, seedfreq, element_count)?;
+                
+                repeat_num += 1;
+            }
+            // Note: Seeds are already masked immediately after find_bestseed
+        }
+        // Note: Seeds are already masked immediately after find_bestseed
+    }
+
+    // Write masked sequence file if requested
+    if let Some(ref mut masked) = masked_writer {
+        for (chr_name, chr_start) in &data.chrtable {
+            if chr_name == "unknown" || chr_name == "padding" {
+                continue; // Skip special chromosome entries
+            }
+            
+            writeln!(masked, ">{}", chr_name)?;
+            
+            // Find the end of this chromosome
+            let chr_end = if let Some((_name, next_start)) = data.chrtable.iter()
+                .find(|(n, _)| n != chr_name && n != "unknown" && n != "padding") {
+                *next_start
+            } else {
+                data.sequence.len()
+            };
+            
+            // Write sequence with masked regions in lowercase
+            for i in *chr_start..chr_end.min(data.sequence.len()) {
+                if data.sequence[i] > 3 {
+                    continue; // Skip invalid bases
+                }
+                let base_char = num_to_char(data.sequence[i]);
+                let output_char = if mask[i] {
+                    base_char.to_ascii_lowercase()
+                } else {
+                    base_char
+                };
+                write!(masked, "{}", output_char)?;
+                
+                // Line wrap at 80 characters
+                if (i - *chr_start + 1) % 80 == 0 {
+                    writeln!(masked)?;
+                }
+            }
+            
+            // Add final newline if needed
+            let chr_len = chr_end.min(data.sequence.len()).saturating_sub(*chr_start);
+            if chr_len % 80 != 0 {
+                writeln!(masked)?;
+            }
+        }
     }
 
     println!("Processed {} repeat families", repeat_num);

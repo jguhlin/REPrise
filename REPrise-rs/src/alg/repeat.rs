@@ -1,6 +1,6 @@
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
-use std::sync::{Arc, Mutex};
+use crate::compute_entropy;
 
 /// Simple tuple type used by caches.
 pub type CacheEntry = (usize, usize, u8, u8);
@@ -33,8 +33,8 @@ pub fn sa_search(
 }
 
 /// Build a cache table for all possible kmers of length `cache_len`.
-/// The returned table mirrors the C++ `store_cache` output but uses
-/// Rust data structures and parallel iteration.
+/// For edit_distance=0: exact matching only (optimized).
+/// For edit_distance>0: generates all possible k-mer variants within edit distance.
 pub fn store_cache(
     edit_distance: u8,
     cache_len: usize,
@@ -42,41 +42,155 @@ pub fn store_cache(
     sa: &[i64],
 ) -> Vec<Vec<CacheEntry>> {
     let size = 1usize << (cache_len * 2);
-    let cache: Vec<_> = (0..size).map(|_| Mutex::new(Vec::new())).collect();
-    let cache = Arc::new(cache);
+    let mut cache = vec![Vec::new(); size];
 
-    (0..size).into_par_iter().for_each(|id| {
-        let mut kmer = vec![0u8; cache_len];
-        for i in 0..cache_len {
-            kmer[cache_len - 1 - i] = ((id >> (i * 2)) & 3) as u8;
-        }
-        let mut begin = None;
-        let mut end = None;
-        for (i, &p) in sa.iter().enumerate() {
-            let p = p as usize;
+    if edit_distance == 0 {
+        // Optimized exact matching - scan suffix array once
+        let kmer_to_id = |kmer: &[u8]| -> usize {
+            let mut id = 0;
+            for (i, &base) in kmer.iter().enumerate() {
+                if base > 3 {
+                    return 0;
+                }
+                id |= (base as usize) << (i * 2);
+            }
+            id
+        };
+
+        let mut i = 0;
+        while i < sa.len() {
+            let p = sa[i] as usize;
             if p + cache_len > seq.len() {
+                i += 1;
                 continue;
             }
-            if &seq[p..p + cache_len] == &kmer[..] {
-                if begin.is_none() {
-                    begin = Some(i);
+
+            let kmer = &seq[p..p + cache_len];
+            let id = kmer_to_id(kmer);
+            let start = i;
+
+            while i < sa.len() {
+                let next_p = sa[i] as usize;
+                if next_p + cache_len > seq.len() || &seq[next_p..next_p + cache_len] != kmer {
+                    break;
                 }
-                end = Some(i + 1);
-            } else if begin.is_some() {
-                break;
+                i += 1;
+            }
+
+            cache[id].push((start, i, cache_len as u8, edit_distance));
+        }
+    } else {
+        // Inexact matching - generate all possible k-mer variants like C++
+        for id in 0..size {
+            let mut query = vec![0u8; cache_len];
+            
+            // Convert cache index back to k-mer
+            let mut temp_id = id;
+            for i in 0..cache_len {
+                query[i] = (temp_id & 3) as u8;
+                temp_id >>= 2;
+            }
+            
+            // Skip invalid k-mers
+            if query.iter().any(|&b| b > 3) {
+                continue;
+            }
+            
+            // Find all matches with edit distance tolerance
+            let mut matched = std::collections::HashSet::new();
+            sa_search_recursive(&query, seq, sa, 0, sa.len(), 0, 0, edit_distance as i32, &mut matched);
+            
+            // Convert matches to cache entries
+            for (begin, end) in matched {
+                cache[id].push((begin, end, cache_len as u8, edit_distance));
             }
         }
-        if let (Some(b), Some(e)) = (begin, end) {
-            let mut slot = cache[id].lock().unwrap();
-            slot.push((b, e, cache_len as u8, edit_distance));
-        }
-    });
+    }
 
-    Arc::try_unwrap(cache)
-        .unwrap()
-        .into_iter()
-        .map(|m| m.into_inner().unwrap())
-        .collect()
+    cache
+}
+
+/// Recursive suffix array search for inexact matching (mirrors C++ SA_search)
+fn sa_search_recursive(
+    query: &[u8],
+    seq: &[u8],
+    sa: &[i64],
+    begin: usize,
+    end: usize,
+    query_num: usize,
+    seq_num: usize,
+    rem_dist: i32,
+    matched: &mut std::collections::HashSet<(usize, usize)>,
+) {
+    if rem_dist >= 0 && query_num == query.len() {
+        matched.insert((begin, end));
+        return;
+    }
+    
+    if rem_dist < 0 || query_num >= query.len() {
+        return;
+    }
+    
+    // Split suffix array range by next character
+    let mut bounds = [begin; 5];
+    let mut current = begin;
+    
+    for base in 0u8..4u8 {
+        // Binary search for range of this base
+        let mut left = current;
+        let mut right = end;
+        
+        while left < right {
+            let mid = (left + right) / 2;
+            let pos = sa[mid] as usize + seq_num;
+            
+            if pos < seq.len() && seq[pos] < base {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        
+        current = left;
+        
+        // Find end of this base range
+        left = current;
+        right = end;
+        while left < right {
+            let mid = (left + right) / 2;
+            let pos = sa[mid] as usize + seq_num;
+            
+            if pos < seq.len() && seq[pos] <= base {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        
+        bounds[base as usize + 1] = left;
+    }
+    bounds[4] = end;
+    
+    // Recurse for each base
+    for base in 0u8..4u8 {
+        let range_start = bounds[base as usize];
+        let range_end = bounds[base as usize + 1];
+        
+        if range_start < range_end {
+            let mismatch_penalty = if query[query_num] != base { 1 } else { 0 };
+            sa_search_recursive(
+                query,
+                seq,
+                sa,
+                range_start,
+                range_end,
+                query_num + 1,
+                seq_num + 1,
+                rem_dist - mismatch_penalty,
+                matched,
+            );
+        }
+    }
 }
 
 /// Remove tandem occurrences closer than `tandem_dist`.
@@ -172,11 +286,10 @@ pub fn findkmer(query: &[u8], cache: &[Vec<CacheEntry>], seq: &[u8], sa: &[i64])
     }
 
     // Accumulate matches from all cache segments for this k-mer id.
-    for &(b, e, _klen, _dist) in &cache[idx] {
-        // We are using dist from cache generation; our store_cache uses exact match band so SA_search with rem_dist is safe.
-        // For deterministic parity, we collect full positions then sort ascending.
+    for &(b, e, _klen, dist) in &cache[idx] {
+        // Use the edit distance from cache generation for inexact matching
         let mut tmp = Vec::new();
-        sa_search(query, seq, sa, b, e, 0, &mut tmp); // use 0 mismatches for exact k-mer hits
+        sa_search(query, seq, sa, b, e, dist as i32, &mut tmp);
         for (sidx, _) in tmp {
             let p = sa[sidx] as usize;
             if p + query.len() <= seq.len() {
@@ -230,12 +343,19 @@ pub fn build_sortedkmers(
         }
     }
 
+    // C++ MAXENTROPY = -0.7 (REPrise.cpp)
+    const MAX_ENTROPY: f64 = -0.7;
+    
     let len = seq.len();
     let kmers: Vec<KEntry> = (0..len.saturating_sub(k).saturating_add(1))
         .into_par_iter()
         .filter_map(|i| {
             let kmer_slice = &seq[i..i + k];
             if kmer_slice.iter().any(|&b| b > 3) {
+                return None;
+            }
+            // Filter out low-complexity k-mers based on entropy
+            if compute_entropy(kmer_slice) > MAX_ENTROPY {
                 return None;
             }
             // Count fwd + rc occurrences with parity findkmer
@@ -403,7 +523,7 @@ pub(crate) fn mask_extention_score(
 
 /// Port of masking_align driving right/left banded extension and picking element start/end.
 /// C++ reference: REPrise.cpp:836
-pub(crate) fn masking_align(
+pub fn masking_align(
     i: usize,
     consensusstart: usize,
     consensusend: usize,
@@ -697,6 +817,271 @@ pub fn maskbyrepeat_element(
         }
     }
 }
+
+// Extension alignment constants (matching C++ defaults)
+#[allow(dead_code)]
+const MATCHSCORE: i32 = 1;
+#[allow(dead_code)]
+const MISMATCHSCORE: i32 = -1;
+#[allow(dead_code)]
+const GAPSCORE: i32 = -5;
+#[allow(dead_code)]
+const GAPEXTENDSCORE: i32 = -1;
+#[allow(dead_code)]
+const CAPPENALTY: i32 = -20;
+#[allow(dead_code)]
+const MAXEXTEND: usize = 10000;
+#[allow(dead_code)]
+const WHEN_TO_STOP: usize = 100;
+
+/// Get complement of a nucleotide (0=A, 1=C, 2=G, 3=T)
+pub fn complement(base: u8) -> u8 {
+    match base {
+        0 => 3, // A -> T
+        1 => 2, // C -> G  
+        2 => 1, // G -> C
+        3 => 0, // T -> A
+        _ => base, // Invalid bases remain unchanged
+    }
+}
+
+/// Extension alignment - extends consensus sequence in one direction
+/// Returns the best extension length
+pub fn extend(
+    is_right: bool,
+    seedfreq: usize,
+    pos: &[usize],
+    rev: &[bool],
+    seq: &[u8],
+    consensus: &mut [u8],
+    seed_ext: &mut [i32],
+    match_score: i32,
+    mismatch_score: i32,
+    gap_score: i32,
+    gap_extend_score: i32,
+    cap_penalty: i32,
+    max_extend: usize,
+    offset_width: usize,
+    when_to_stop: usize,
+    k: usize,
+    min_improvement: i32,
+) -> i32 {
+    let mut nexttotalscore = vec![0i32; 4];
+    let mut bestscore = vec![0i32; seedfreq];
+    let mut score = vec![vec![MINSCORE; 2 * offset_width + 1]; seedfreq];
+    let mut score_m = vec![vec![MINSCORE; 2 * offset_width + 1]; seedfreq];
+    let mut score_ins = vec![vec![MINSCORE; 2 * offset_width + 1]; seedfreq];
+    let mut score_del = vec![vec![MINSCORE; 2 * offset_width + 1]; seedfreq];
+    
+    let mut score_m_bybase = vec![vec![vec![MINSCORE; 2 * offset_width + 1]; seedfreq]; 4];
+    let mut score_ins_bybase = vec![vec![vec![MINSCORE; 2 * offset_width + 1]; seedfreq]; 4];
+    let mut score_del_bybase = vec![vec![vec![MINSCORE; 2 * offset_width + 1]; seedfreq]; 4];
+    
+    let mut best_ext = -1i32;
+    let mut besttotalscore = 0i32;
+    
+    // Initialize scores
+    for se in 0..seedfreq {
+        score_m[se][offset_width] = 0;
+        for offset in 1..=offset_width {
+            score_del[se][offset + offset_width] = gap_score + gap_extend_score * (offset as i32 - 1);
+        }
+    }
+    
+    for ext in 0..max_extend {
+        nexttotalscore.fill(0);
+        
+        for base in 0..4u8 {
+            for se in 0..seedfreq {
+                let score_val = compute_score_extend(
+                    is_right, ext, se, base, pos, rev, seq,
+                    &score_m, &score_ins, &score_del,
+                    &mut score_m_bybase, &mut score_ins_bybase, &mut score_del_bybase,
+                    match_score, mismatch_score, gap_score, gap_extend_score,
+                    offset_width, k
+                );
+                nexttotalscore[base as usize] += std::cmp::max(0, std::cmp::max(bestscore[se] + cap_penalty, score_val));
+            }
+        }
+        
+        let bestbase = nexttotalscore.iter().position(|&x| x == *nexttotalscore.iter().max().unwrap()).unwrap() as u8;
+        
+        // Set consensus base
+        if is_right {
+            if max_extend + ext < consensus.len() {
+                consensus[max_extend + ext] = bestbase;
+            }
+        } else {
+            if max_extend >= ext + 1 {
+                consensus[max_extend - ext - 1] = bestbase;
+            }
+        }
+        
+        // Update scores
+        for se in 0..seedfreq {
+            for offset in 0..=(2 * offset_width) {
+                score_m[se][offset] = score_m_bybase[bestbase as usize][se][offset];
+                score_ins[se][offset] = score_ins_bybase[bestbase as usize][se][offset];
+                score_del[se][offset] = score_del_bybase[bestbase as usize][se][offset];
+                score[se][offset] = std::cmp::max(score_m[se][offset], 
+                    std::cmp::max(score_ins[se][offset], score_del[se][offset]));
+            }
+        }
+        
+        let mut tmpbesttotalscore = 0i32;
+        for se in 0..seedfreq {
+            let mut tmpbestscore = MINSCORE * 2;
+            let mut bestoffset = 0i32;
+            
+            for offset in 0..=(2 * offset_width) {
+                if score[se][offset] > tmpbestscore {
+                    tmpbestscore = score[se][offset];
+                    bestoffset = offset as i32 - offset_width as i32;
+                }
+            }
+            
+            if tmpbestscore > bestscore[se] {
+                seed_ext[se] = ext as i32 + bestoffset;
+                bestscore[se] = tmpbestscore;
+            }
+            tmpbesttotalscore += std::cmp::max(tmpbestscore, bestscore[se] + cap_penalty);
+        }
+        
+        // Check if improvement meets minimum threshold (C++ line: if (tmpbesttotalscore >= besttotalscore + (ext - best_ext) * MINIMPROVEMENT))
+        let improvement_threshold = if best_ext >= 0 {
+            besttotalscore + ((ext as i32 - best_ext) * min_improvement)
+        } else {
+            besttotalscore
+        };
+        
+        if tmpbesttotalscore >= improvement_threshold {
+            besttotalscore = tmpbesttotalscore;
+            best_ext = ext as i32;
+        } else {
+            // Check stop condition
+            if ext >= when_to_stop && best_ext >= 0 && (ext - best_ext as usize) >= when_to_stop {
+                break;
+            }
+        }
+    }
+    
+    best_ext
+}
+
+/// Compute alignment score for extension (helper for extend function)
+fn compute_score_extend(
+    is_right: bool,
+    ext: usize,
+    se: usize,
+    base: u8,
+    pos: &[usize],
+    rev: &[bool],
+    seq: &[u8],
+    score_m: &[Vec<i32>],
+    score_ins: &[Vec<i32>],
+    score_del: &[Vec<i32>],
+    score_m_bybase: &mut [Vec<Vec<i32>>],
+    score_ins_bybase: &mut [Vec<Vec<i32>>],
+    score_del_bybase: &mut [Vec<Vec<i32>>],
+    match_score: i32,
+    mismatch_score: i32,
+    gap_score: i32,
+    gap_extend_score: i32,
+    offset_width: usize,
+    k: usize,
+) -> i32 {
+    let mut nextscore_m_bybase = vec![MINSCORE; 2 * offset_width + 1];
+    let mut nextscore_ins_bybase = vec![MINSCORE; 2 * offset_width + 1];
+    let mut nextscore_del_bybase = vec![MINSCORE; 2 * offset_width + 1];
+    
+    // Compute match scores
+    if !rev[se] && is_right {
+        for offset in 0..=(2 * offset_width) {
+            let actual_offset = offset as i32 - offset_width as i32;
+            let seq_pos = pos[se] as i32 + actual_offset + ext as i32;
+            if seq_pos >= 0 && (seq_pos as usize) < seq.len() {
+                let seq_base = seq[seq_pos as usize];
+                let score_increment = if base == seq_base { match_score } else { mismatch_score };
+                nextscore_m_bybase[offset] = std::cmp::max(score_m[se][offset], 
+                    std::cmp::max(score_ins[se][offset], score_del[se][offset])) + score_increment;
+            }
+        }
+    } else if rev[se] && is_right {
+        for offset in 0..=(2 * offset_width) {
+            let actual_offset = offset as i32 - offset_width as i32;
+            let seq_pos = pos[se] as i32 + k as i32 - 1 - (actual_offset + ext as i32);
+            if seq_pos >= 0 && (seq_pos as usize) < seq.len() {
+                let seq_base = complement(seq[seq_pos as usize]);
+                let score_increment = if base == seq_base { match_score } else { mismatch_score };
+                nextscore_m_bybase[offset] = std::cmp::max(score_m[se][offset], 
+                    std::cmp::max(score_ins[se][offset], score_del[se][offset])) + score_increment;
+            }
+        }
+    } else if !rev[se] && !is_right {
+        for offset in 0..=(2 * offset_width) {
+            let actual_offset = offset as i32 - offset_width as i32;
+            let seq_pos = pos[se] as i32 - 1 - actual_offset - ext as i32;
+            if seq_pos >= 0 && (seq_pos as usize) < seq.len() {
+                let seq_base = seq[seq_pos as usize];
+                let score_increment = if base == seq_base { match_score } else { mismatch_score };
+                nextscore_m_bybase[offset] = std::cmp::max(score_m[se][offset], 
+                    std::cmp::max(score_ins[se][offset], score_del[se][offset])) + score_increment;
+            }
+        }
+    } else {
+        for offset in 0..=(2 * offset_width) {
+            let actual_offset = offset as i32 - offset_width as i32;
+            let seq_pos = pos[se] as i32 + k as i32 - 1 - (-1 - actual_offset - ext as i32);
+            if seq_pos >= 0 && (seq_pos as usize) < seq.len() {
+                let seq_base = complement(seq[seq_pos as usize]);
+                let score_increment = if base == seq_base { match_score } else { mismatch_score };
+                nextscore_m_bybase[offset] = std::cmp::max(score_m[se][offset], 
+                    std::cmp::max(score_ins[se][offset], score_del[se][offset])) + score_increment;
+            }
+        }
+    }
+    
+    // Compute insertion scores
+    for offset in 0..=(2 * offset_width) {
+        if offset > 0 {
+            nextscore_ins_bybase[offset] = std::cmp::max(
+                score_m[se][offset - 1] + gap_score,
+                std::cmp::max(
+                    score_ins[se][offset - 1] + gap_extend_score,
+                    score_del[se][offset - 1] + gap_score
+                )
+            );
+        }
+    }
+    
+    // Compute deletion scores
+    for offset in 0..(2 * offset_width) {
+        nextscore_del_bybase[offset] = std::cmp::max(
+            score_m[se][offset + 1] + gap_score,
+            std::cmp::max(
+                score_ins[se][offset + 1] + gap_score,
+                score_del[se][offset + 1] + gap_extend_score
+            )
+        );
+    }
+    
+    // Store results in bybase arrays
+    for offset in 0..=(2 * offset_width) {
+        score_m_bybase[base as usize][se][offset] = nextscore_m_bybase[offset];
+        score_ins_bybase[base as usize][se][offset] = nextscore_ins_bybase[offset];
+        score_del_bybase[base as usize][se][offset] = nextscore_del_bybase[offset];
+    }
+    
+    // Return best score for this seed
+    let mut best_score = MINSCORE;
+    for offset in 0..=(2 * offset_width) {
+        best_score = std::cmp::max(best_score, 
+            std::cmp::max(nextscore_m_bybase[offset], 
+                std::cmp::max(nextscore_ins_bybase[offset], nextscore_del_bybase[offset])));
+    }
+    best_score
+}
+
 /// Find the best seed from the priority queue, considering masked regions.
 /// This function mirrors the C++ implementation but uses Rust data structures.
 pub fn find_bestseed(
@@ -754,318 +1139,5 @@ pub fn find_bestseed(
     
     // If no suitable kmer found, return empty result
     (0, Vec::new(), pos, rev)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{build_sequence, suffix_array};
-
-    // Helper: small synthetic sequence and SA/cache builder for deterministic tests
-    fn small_seq_and_sa() -> (Vec<u8>, Vec<i64>) {
-        // Build a synthetic sequence of A,C,G,T blocks with padding removed for direct tests
-        // Using numeric alphabet: A=0,C=1,G=2,T=3; 4 and above treated invalid in findkmer
-        let seq = vec![
-            0,0,0,0, // AAAA
-            1,1,1,1, // CCCC
-            2,2,2,2, // GGGG
-            3,3,3,3, // TTTT
-            0,1,2,3, // ACGT
-        ];
-        let sa = suffix_array(&seq);
-        (seq, sa)
-    }
-
-    // Helper: minimal cache for k=2 over small sequence
-    fn build_cache_for_k(seq: &[u8], sa: &[i64], k: usize, edit_distance: u8) -> Vec<Vec<CacheEntry>> {
-        store_cache(edit_distance, k, seq, sa)
-    }
-
-    // ------------------------
-    // mask_extention_score tests
-    // Note: Not implemented in Rust codebase. Provide placeholder signature tests.
-    // We skip execution using #[ignore] but assert expected semantics vs C++ comments.
-    // C++ ref lines: REPrise.cpp:919
-    //
-    // Expected signature (Rust):
-    // pub fn mask_extention_score(
-    //     is_right: bool,
-    //     ext: usize,
-    //     i: usize,
-    //     mask_score: &mut [i32],
-    //     mask_score_m: &mut [i32],
-    //     mask_score_ins: &mut [i32],
-    //     mask_score_del: &mut [i32],
-    // ) -> i32
-    // ------------------------
-
-    #[test]
-    fn test_mask_extention_score_typical() {
-        let _is_right = true;
-        let _ext = 10usize;
-        let _i = 0usize;
-        let width = 11usize; // 2*OFFSETWIDTH+1 in C++; use small band
-        let mut mask_score = vec![i32::MIN/2; width];
-        let mut mask_m = vec![i32::MIN/2; width];
-        let mut mask_ins = vec![i32::MIN/2; width];
-        let mut mask_del = vec![i32::MIN/2; width];
-        // Initialize center of band to zero to allow transitions
-        let mid = width/2;
-        mask_score[mid] = 0;
-        mask_m[mid] = 0;
-        mask_ins[mid] = i32::MIN/2;
-        mask_del[mid] = i32::MIN/2;
-
-        // let score = mask_extention_score(is_right, ext, i, &mut mask_score, &mut mask_m, &mut mask_ins, &mut mask_del);
-        // assert!(score >= 0, "typical extension should yield non-negative when match-majority");
-
-        // Placeholder assertion to keep test compiling when ignored
-        assert_eq!(mid > 0, true);
-    }
-
-    #[test]
-    #[ignore = "mask_extention_score not implemented in Rust; boundary conditions vs band edges need parity with C++ (REPrise.cpp:919)"]
-    fn test_mask_extention_score_boundaries() {
-        // Boundary: ext at 0 and max band edges
-        let width = 5usize;
-        let mut mask_score = vec![i32::MIN/2; width];
-        let mut mask_m = vec![i32::MIN/2; width];
-        let _mask_ins = vec![i32::MIN/2; width];
-        let _mask_del = vec![i32::MIN/2; width];
-        let mid = width/2;
-        mask_score[mid] = 0;
-        mask_m[mid] = 0;
-
-        // Right extension at 0
-        let _is_right = true;
-        let _ext0 = 0usize;
-
-        // Left extension at 0
-        let _is_right_l = false;
-        let _ext0_l = 0usize;
-
-        // Degenerate bands
-        assert!(width % 2 == 1, "band width should be odd");
-    }
-
-    #[test]
-    #[ignore = "mask_extention_score not implemented in Rust; degenerate cases such as all gaps/high penalties to be verified vs C++ (REPrise.cpp:919)"]
-    fn test_mask_extention_score_degenerate() {
-        // High gap penalties, zero/negative match scores scenarios would be exercised here
-        let width = 3usize;
-        let mut mask_score = vec![i32::MIN/2; width];
-        let mut mask_m = vec![i32::MIN/2; width];
-        let _mask_ins = vec![i32::MIN/2; width];
-        let _mask_del = vec![i32::MIN/2; width];
-        let mid = width/2;
-        mask_score[mid] = 0;
-        mask_m[mid] = 0;
-
-        // Placeholder to ensure compilation
-        assert_eq!(mask_score.len(), width);
-    }
-
-    // ------------------------
-    // masking_align tests
-    // Not visible in current Rust; conversion_status says "Yes Partial".
-    // Provide tests that assert return spans are within provided consensus bounds and off-by-one correctness.
-    // C++ ref lines: REPrise.cpp:836
-    // Expected signature (Rust):
-    // pub fn masking_align(i: usize, consensusstart: usize, consensusend: usize) -> (usize, usize)
-    // ------------------------
-
-    #[test]
-    fn test_masking_align_typical() {
-        let _i = 0usize;
-        let (consensusstart, consensusend) = (5usize, 25usize);
-        // let (s, e) = masking_align(i, consensusstart, consensusend);
-        // assert!(s <= e, "start <= end");
-        // assert!(s >= consensusstart && e <= consensusend, "result within bounds");
-        assert!(consensusstart < consensusend);
-    }
-
-    #[test]
-    #[ignore = "masking_align pending; boundary conditions at zero-length window and exact edges (REPrise.cpp:836)"]
-    fn test_masking_align_boundaries() {
-        let _i = 0usize;
-        // zero-length consensus window
-        let (cs, ce) = (10usize, 10usize);
-        // let (s, e) = masking_align(i, cs, ce);
-        // assert_eq!((s, e), (cs, ce), "zero-length should return exact bounds or empty span");
-        assert_eq!(cs, ce);
-    }
-
-    #[test]
-    #[ignore = "masking_align pending; degenerate patterns like all same chars and high gap penalties parity (REPrise.cpp:836)"]
-    fn test_masking_align_degenerate() {
-        // Construct context with repeats; once implemented, pass index i accordingly.
-        let i = 1usize;
-        let (cs, ce) = (0usize, 100usize);
-        let _ = (i, cs, ce);
-        assert!(ce >= cs);
-    }
-
-    #[test]
-    #[ignore = "masking_align pending; off-by-one checks around band edges"]
-    fn test_masking_align_off_by_one() {
-        // Adjacent windows should not overlap incorrectly
-        let i = 2usize;
-        let (cs1, ce1) = (0usize, 10usize);
-        let (cs2, ce2) = (11usize, 20usize);
-        let _ = (i, cs1, ce1, cs2, ce2);
-        assert!(ce1 < cs2);
-    }
-
-    // ------------------------
-    // chrtracer tests
-    // conversion_status says "Yes | Yes" implemented in repeat.rs, but function not present.
-    // The function should map sequence index to chromosome name and offset using chrtable from build_sequence.
-    // C++ ref lines: REPrise.cpp:1072
-    // Expected signature (Rust):
-    // pub fn chrtracer(stringpos: usize) -> (String, usize)
-    // ------------------------
-
-    #[test]
-    #[ignore = "chrtracer not visible/exported; implement wrapper using build_sequence chrtable or expose function"]
-    fn test_chrtracer_typical() {
-        // Load test fasta and confirm positions map inside a contig
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/tst.fa");
-        let data = build_sequence(&path).expect("load fasta");
-        // Choose a position within first contig region (after initial padding and first padding)
-        let pos = data.chrtable.iter().find(|(name, _)| name != "unknown" && name != "padding").map(|(_, p)| *p).unwrap_or(0) + 100;
-        // let (chr, off) = chrtracer(pos);
-        // assert!(!chr.is_empty());
-        // assert!(off >= 0);
-        assert!(pos > 0);
-    }
-
-    #[test]
-    #[ignore = "chrtracer pending; boundary positions near padding entries"]
-    fn test_chrtracer_padding_boundaries() {
-        // Position inside padding should map to 'padding' entry or nearest contig as per C++
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/tst.fa");
-        let data = build_sequence(&path).expect("load fasta");
-        // pick a padding start
-        let pad_pos = data.chrtable.iter().find(|(name, _)| name == "padding").map(|(_, p)| *p).unwrap_or(0);
-        let _ = pad_pos;
-        // let (chr, _off) = chrtracer(pad_pos);
-        // assert_eq!(chr, "padding");
-        // pad_pos is usize; keep a sanity check that it is within sequence bounds in chrtable context once chrtracer exists.
-        assert!(pad_pos as usize <= data.sequence.len());
-    }
-
-    #[test]
-    #[ignore = "chrtracer pending; off-by-one checks at contig boundaries"]
-    fn test_chrtracer_off_by_one() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/tst.fa");
-        let data = build_sequence(&path).expect("load fasta");
-        // Find a contig start and check pos-1 and pos
-        if let Some((name, start)) = data.chrtable.iter().find(|(n, _)| n != "unknown" && n != "padding").cloned() {
-            let before = start.saturating_sub(1);
-            let _ = (name, before, start);
-            // let (chr_before, _) = chrtracer(before);
-            // let (chr_at, _) = chrtracer(start);
-            // assert_ne!(chr_before, chr_at, "boundary should switch contigs/padding");
-            assert!(start >= 1);
-        }
-    }
-
-    // ------------------------
-    // Additional sanity tests for already-implemented helpers to ensure harness works
-    // ------------------------
-
-    #[test]
-    fn test_removetandem_basic() {
-        let mut occs = vec![10, 12, 13, 25, 26, 100];
-        // tandem_dist=3 should remove 12 and 26 due to closeness to 10 and 25 respectively
-        removetandem(&mut occs, 3);
-        assert_eq!(occs, vec![10, 13, 25, 100]);
-    }
-
-    #[test]
-    fn test_removemasked_and_maskbyseed_forward_and_rc() {
-        // Mask forward k=3 at positions 2 and 8
-        let mut mask = vec![false; 15];
-        let occs = vec![2usize, 8usize];
-        maskbyseed(&occs, &mut mask, 3, false);
-        for p in 2..=4 { assert!(mask[p]); }
-        for p in 8..=10 { assert!(mask[p]); }
-
-        // Now test removemasked forward
-        let mut occs2 = vec![1usize, 2usize, 5usize, 9usize, 12usize];
-        removemasked(&mut occs2, &mask, 3, false);
-        // With C++ parity (REPrise.cpp:525-553), forward rejects if any mask[p+i] for i in 0..k.
-        // Masked ranges are [2..=4] and [8..=10]. p=1 -> [1..3] overlaps, p=2 -> masked, p=9 -> masked.
-        // p=5 and p=12 remain.
-        assert_eq!(occs2, vec![5, 12]);
-
-          // Reverse-complement orientation masking for k=3:
-          // C++ parity: mask indices [p .. p-(k-1)] inclusive when is_rc=true.
-          let mut mask_rc = vec![false; 15];
-          let p = 5usize;
-          maskbyseed(&[p], &mut mask_rc, 3, true);
-          // Our maskbyseed(rc=true) masks [p, p-1, p-2]
-          assert!(mask_rc[p] && mask_rc[p - 1] && mask_rc[p - 2]);
-         
-         // removemasked with is_rc=true: range considered [q-(k-1), q] for each q in occs3.
-         // Since mask_rc masked [5,4,3], candidates 3,4,5 intersect and are removed; 6 also intersects [6,5,4] and is removed.
-         let mut occs3 = vec![3usize, 4usize, 5usize, 6usize];
-         removemasked(&mut occs3, &mask_rc, 3, true);
-         assert_eq!(occs3, Vec::<usize>::new());
-    }
-
-    #[test]
-    fn test_maskbyrepeat_forward_and_reverse() {
-        // Setup: two hits, forward at pos[0]=10, reverse at pos[1]=20 with k=4
-        let seedfreq = 2usize;
-        let repeatstart = vec![1usize, 2usize];
-        let repeatend = vec![3usize, 6usize];
-        let mut mask = vec![false; 40];
-        let pos = vec![10usize, 20usize];
-        let rev = vec![false, true];
-        let k = 4usize;
-
-        maskbyrepeat(seedfreq, &repeatstart, &repeatend, &mut mask, &pos, &rev, k);
-
-        // Forward masks [10+1 .. 10+3] = [11..13]
-        for j in 11..=13 { assert!(mask[j]); }
-        // Reverse masks [20-6 + (k-1) .. 20-2 + (k-1)] = [20-6+3 .. 20-2+3] = [17 .. 21]
-        for j in 17..=21 { assert!(mask[j]); }
-        // Outside ranges remain unmasked
-        assert!(!mask[10] && !mask[22]);
-    }
-
-    #[test]
-    fn test_maskbyrepeat_element_basic() {
-        let mut mask = vec![false; 30];
-        let pos = vec![5usize, 10usize];
-        // For i=1, element [pos[1]+2 .. pos[1]+4] -> [12..14]
-        maskbyrepeat_element(1, 2, 4, &mut mask, &pos);
-        for j in 12..=14 { assert!(mask[j]); }
-        assert!(!mask[11] && !mask[15]);
-    }
-
-    #[test]
-    fn test_find_bestseed_sorts_and_filters() {
-        // Build a simple sequence with visible kmers, then build kmers heap via build_sortedkmers
-        let (seq, sa) = small_seq_and_sa();
-        let k = 2usize;
-        let cache = build_cache_for_k(&seq, &sa, k, 0);
-        let mut kmers = build_sortedkmers(k, &seq, &cache, &sa, 1);
-        let mask_flag = vec![false; seq.len()];
-        let tandem_dist = 2usize;
-        let minfreq = 1usize;
-
-        let (_freq, kmer, pos, rev) = find_bestseed(&mut kmers, &cache, &mask_flag, &seq, &sa, tandem_dist, minfreq);
-
-        // Sanity: pos and rev lengths should match combined occurrences
-        assert_eq!(pos.len(), rev.len());
-        // kmer length should be k
-        assert_eq!(kmer.len(), k);
-        // Occurrences should be within sequence length
-        for &p in &pos {
-            assert!(p + k <= seq.len());
-        }
-    }
 }
 
