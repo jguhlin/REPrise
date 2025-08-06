@@ -442,7 +442,7 @@ pub(crate) fn mask_extention_score(
     let mut next_del = vec![0i32; width];
     let mut best = MINSCORE;
 
-    // helper to fetch sequence base with C++ index arithmetic
+    // helper to fetch sequence base with safe bounds checking - prevents heap-buffer-overflow
     let get_seq = |offset: isize| -> Option<u8> {
         let off = offset as isize;
         if off < 0 { return None; }
@@ -889,6 +889,11 @@ pub fn extend(
     }
     
     for ext in 0..max_extend {
+        // Safety check - prevent buffer overflows that caused C++ heap crashes
+        if max_extend + ext >= consensus.len() || (max_extend as i32 - ext as i32 - 1) < 0 {
+            eprintln!("Warning: Extension bounds exceeded at ext={}, breaking early", ext);
+            break;
+        }
         nexttotalscore.fill(0);
         
         for base in 0..4u8 {

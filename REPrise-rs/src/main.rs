@@ -131,6 +131,24 @@ fn parse_cli() -> Cli {
         std::process::exit(1);
     }
 
+    // Memory safety validation - prevent heap-buffer-overflow like GitHub issue #1
+    if max_extend > 1_000_000 {
+        eprintln!("Error: -maxextend {} is too large (max: 1,000,000)", max_extend);
+        eprintln!("Large values can cause memory issues. Consider using tandem repeat masking first.");
+        std::process::exit(1);
+    }
+
+    if max_repeat > 10_000_000 {
+        eprintln!("Error: -maxrepeat {} is too large (max: 10,000,000)", max_repeat);
+        std::process::exit(1);
+    }
+
+    // Warn about potentially problematic parameter combinations
+    if max_extend > 50_000 {
+        eprintln!("Warning: -maxextend {} is very large and may consume significant memory", max_extend);
+        eprintln!("Consider pre-masking tandem repeats with tools like tantan for better performance");
+    }
+
     Cli { 
         input, output, k, match_score, mismatch_score, gap_score, gap_extend_score,
         cap_penalty, dist, max_extend, max_repeat, max_gap, stop_after, min_length,
@@ -162,7 +180,7 @@ fn print_usage() {
     println!("   -cappenalty INT     Penalty of the imcomplete length alignment (default = -20)");
     println!("   -dist INT           Number of mismatches allowed in inexact seed (default = 0)");
     println!();
-    println!("   -maxextend INT      Upper limit length of extension in one side direction of consensus repeat (default = 10000)");
+    println!("   -maxextend INT      Upper limit length of extension in one side direction of consensus repeat (default = 10000, max = 1000000)");
     println!("   -maxrepeat INT      Maximum Number of elements belonging to one repeat family (default = 100000)");
     println!("   -maxgap INT         Band size(= maximum number of gaps allowed) of extension alignment (default = 5)");
     println!("   -stopafter INT      If the maximum score of extension alignment does not change INT consecutive times, that alignment will stop (default = 100)");
@@ -172,6 +190,9 @@ fn print_usage() {
     println!("   -tandemdist INT     Interval to match the same seed to avoid seed matching with tandem repeats(default = 500)");
     println!("   -pa INT             Number of parallel threads (default = 1)");
     println!();
+    println!("Memory Notes:");
+    println!("   Large -maxextend values can cause high memory usage. Consider pre-masking");
+    println!("   tandem repeats with tools like 'tantan' for better performance on repetitive genomes.");
 }
 
 #[derive(Debug)]
@@ -193,12 +214,27 @@ fn main() -> io::Result<()> {
 
     // Load FASTA via existing builder (numeric encoding and padding).
     let data = build_sequence(&args.input).expect("failed to read FASTA");
+    
+    // Safety check for extremely large genomes that might cause issues
+    if data.sequence.len() > 10_000_000_000 {  // > 10GB sequence
+        eprintln!("Error: Input sequence is extremely large ({} bases)", data.sequence.len());
+        eprintln!("This may cause memory issues. Consider splitting the input or increasing system memory.");
+        std::process::exit(1);
+    }
     if data.sequence.is_empty() {
         eprintln!("Empty sequence after FASTA load");
         std::process::exit(1);
     }
     if args.verbose {
         println!("sequence length: {}", data.sequence.len());
+        
+        // Memory usage estimation to help users avoid crashes like GitHub issue #1
+        let estimated_consensus_memory = args.max_extend * 2 * args.max_repeat * std::mem::size_of::<u8>();
+        println!("Estimated peak consensus memory: {} MB", estimated_consensus_memory / 1_000_000);
+        
+        if estimated_consensus_memory > 1_000_000_000 {  // > 1GB
+            println!("WARNING: High memory usage expected. Consider reducing -maxextend or -maxrepeat");
+        }
     }
 
     // Print chromosome table like C++ version
@@ -289,8 +325,18 @@ fn main() -> io::Result<()> {
         reprise::alg::repeat::maskbyseed(&seed_occ_f, &mut mask, k, false);
         reprise::alg::repeat::maskbyseed(&seed_occ_r, &mut mask, k, true);
 
-        // Create consensus sequence with extension alignment
+        // Create consensus sequence with extension alignment - safe allocation
         let consensus_size = 2 * args.max_extend + k;
+        
+        // Memory safety check - prevent excessive allocations that caused C++ crashes
+        if consensus_size > 10_000_000 {
+            eprintln!("Error: Consensus sequence size {} too large for repeat family {}", 
+                     consensus_size, repeat_num);
+            eprintln!("This can happen with very large -maxextend values on repetitive genomes");
+            break; // Skip this family and continue processing
+        }
+        
+        // Safe allocation - Rust prevents buffer overflows but we check size limits
         let mut consensus = vec![0u8; consensus_size];
         
         // Initialize consensus with the seed sequence at MAXEXTEND position

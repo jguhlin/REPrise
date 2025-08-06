@@ -1,4 +1,13 @@
+// Ensure REPrise runs only on 64-bit targets for large genome support
+#[cfg(target_pointer_width = "32")]
+compile_error!("REPrise requires a 64-bit target to handle large genomes.");
+
 pub mod alg;
+pub mod mask;
+pub mod error;
+pub mod genome;
+pub mod kmer;
+pub mod index;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
