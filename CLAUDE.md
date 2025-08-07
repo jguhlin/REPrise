@@ -1,104 +1,70 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude when working with code in this repository.
 
 ## Project Overview
 
 REPrise is a de novo interspersed repeat detection tool using inexact seeding. This repository contains:
 
-1. **Original C++ implementation** (`REPrise.cpp`, `REPrise.hpp`) - The reference implementation. *Make no changes to this code.*
-2. **Rust port** (`REPrise-rs/`) - A 1:1 parity port of the C++ implementation with additional CLI interface
-3. **Evaluation and testing tools** - JSON-based equivalence testing between C++ and Rust versions
+1.  **Original C++ implementation** (`REPrise.cpp`, `REPrise.hpp`) - The reference implementation. *Make no changes to this code.*
+2.  **Rust port** (`REPrise-rs/`) - A port of the C++ implementation that is being evolved for large-scale genomics.
+3.  **Evaluation and testing tools** - JSON-based equivalence testing between C++ and Rust versions.
 
-## Build Commands
+## Next Generation Architecture (REPrise v2.0)
 
-### C++ Version
-```bash
-# Build the main REPrise executable
-make
+To support extremely large (>10 Gbp) and highly fragmented (>100,000 contigs) genomes, REPrise is moving beyond 1:1 C++ parity towards a new, highly scalable architecture. The focus is on performance, memory efficiency, and robust handling of complex genomic data.
 
-# Build the JSON equivalence test utility  
-make eq-cpp
+### Core Principles
 
-# Clean build artifacts
-make clean
-```
+*   **Memory Bounded:** All operations will be designed to work within a configurable memory footprint, avoiding out-of-memory errors on large datasets.
+*   **Streaming First:** Genomes will be processed as streams of contigs or chunks, never requiring the full sequence to be loaded into memory.
+*   **Concurrency by Design:** The pipeline will be built on a producer-consumer model to maximize parallelism and throughput.
+*   **Contig-Awareness:** All algorithms will respect contig boundaries to ensure biological accuracy.
 
-### Rust Version
-```bash
-# Run the CLI with default test file
-cargo run --manifest-path REPrise-rs/Cargo.toml -- --fasta test/tst.fa
+### Key Architectural Changes
 
-# Run with output to file
-cargo run --manifest-path REPrise-rs/Cargo.toml -- --fasta test/tst.fa --out results.tsv
+1.  **Dual-Strategy Repeat Finding:**
+    *   **`heuristic` (Default):** A new, SA-free approach using k-mer hashing and indexing for maximum scalability. This will be the recommended strategy for large or fragmented genomes.
+    *   **`suffix-array` (Legacy):** The existing high-fidelity port of the C++ implementation will be maintained for smaller genomes and validation purposes.
 
-# Run tests
-cargo test --manifest-path REPrise-rs/Cargo.toml
+2.  **Producer-Consumer Pipeline:**
+    *   A `crossbeam` channel will be used to stream candidate repeat pairs from producers (k-mer indexers) to consumers (alignment workers).
+    *   The channel will be bounded, providing backpressure to control memory usage.
+    *   Work will be batched to reduce channel overhead.
 
-# Run integration equivalence tests
-cargo test --manifest-path REPrise-rs/Cargo.toml --test equiv -- --nocapture
-```
+3.  **Atomic Region Masking:**
+    *   A custom `Bitmask` with atomic operations (`AtomicU64`) will be used to track claimed genomic regions.
+    *   `ClaimGuard` (RAII) will ensure that claimed regions are automatically and safely released, even in the event of a panic. This is critical for safe concurrency.
 
-## Testing and Equivalence Validation
+4.  **Contig-Aware Genome Representation:**
+    *   The `Genome` API will manage global vs. local coordinates, allowing algorithms to operate on a unified position space while respecting contig boundaries.
+    *   The `needletail` crate will be used for high-performance, streaming FASTA parsing.
 
-The project uses a three-step equivalence testing approach:
+### Recommended Crates for v2.0
 
-1. **Build C++ JSON emitter**: `make eq-cpp`
-2. **Run Rust integration harness**: `cargo test --test equiv -- --nocapture`  
-3. **Compare outputs**: `pixi run python eval/compare_equiv.py`
-
-Expected result: "EQUIVALENCE PASS" when schemas and outputs match.
-
-## Architecture
-
-### Key Concepts
-- **Inexact Seeding**: Uses k-mers with allowed edit distance for initial repeat detection
-- **Extension Alignment**: Extends seed matches using banded dynamic programming
-- **Masking Strategy**: Prevents overlapping repeat calls through progressive masking
-
-### Core Data Structures
-- **Suffix Array**: Used for efficient k-mer occurrence lookup
-- **Cache Table**: Pre-computed k-mer variants for inexact matching
-- **Mask Array**: Boolean array tracking masked genome regions
-
-### Critical Function Categories
-
-1. **Index Building**:
-   - `store_cache`: Builds k-mer cache for inexact matching
-   - `build_sortedkmers`: Creates frequency-sorted k-mer priority queue
-   - `build_sequence`: Loads FASTA and creates padded numeric sequence
-
-2. **Repeat Detection**:
-   - `findkmer`: Locates k-mer occurrences using cache and suffix array
-   - `find_bestseed`: Selects highest frequency unmasked seed
-   - `masking_align`/`mask_extention_score`: Performs banded DP extension
-
-3. **Masking and Filtering**:
-   - `removetandem`: Filters closely spaced occurrences
-   - `removemasked`: Excludes already-masked regions
-   - `maskbyseed`/`maskbyrepeat`: Updates mask array
+*   **`needletail`**: For fast, memory-efficient FASTA/Q parsing.
+*   **`ahash`**: For a fast, DoS-resistant hashing algorithm for k-mer indexing.
+*   **`rayon`**: For data parallelism in tasks like initial k-mer counting.
+*   **`crossbeam`**: For high-performance, lock-free channels for the main pipeline.
+*   **`clap`**: For a robust and user-friendly CLI.
+*   **`thiserror`**: For clean, structured error handling.
 
 ## Development Workflow
 
-### Function Porting (C++ → Rust)
-1. Check specs in `function_spec.md`
-2. Implement in `REPrise-rs/src/alg/repeat.rs`
-3. Add unit tests in same file under `cfg(test)`
-4. Update status in `conversion_status.md` and `docs/rep_conversion_status.md`
-5. Test equivalence with full pipeline
+### v2.0 Development
+1.  Implement the `heuristic` strategy using the producer-consumer pipeline.
+2.  Develop robust k-mer indexing and candidate generation for the producer.
+3.  Implement the alignment and scoring logic in the consumer.
+4.  Ensure the `Bitmask` and `ClaimGuard` are used for safe concurrent processing.
+5.  Add comprehensive benchmarks for large and fragmented genomes.
 
-### Key Files to Monitor
-- **Status tracking**: `conversion_status.md`, `docs/rep_conversion_status.md`
-- **Function specs**: `function_spec.md`
-- **Core algorithms**: `REPrise-rs/src/alg/repeat.rs`
-- **Integration tests**: `REPrise-rs/tests/equiv.rs`
-- **CLI interface**: `REPrise-rs/src/main.rs`
+### Legacy Maintenance
+*   The C++ implementation and the `suffix-array` Rust strategy are considered feature-complete.
+*   Changes to the legacy code should only be for bug fixes or to maintain compatibility with the testing harness.
 
 ## Testing Strategy
 
-- **Unit tests**: Co-located with implementation in Rust modules
-- **Integration tests**: JSON-based equivalence between C++ and Rust
-- **CLI tests**: Use `test/tst.fa` as canonical test input
-- **Deterministic output**: All operations maintain consistent ordering for reproducible results
-
-The project prioritizes 1:1 behavioral parity between C++ reference and Rust port, with comprehensive testing to ensure equivalence at both function and system levels.
+*   **Unit tests**: For individual components of the new architecture.
+*   **Integration tests**: For the full `heuristic` pipeline.
+*   **Equivalence testing**: The existing JSON-based tests will be used to ensure the `suffix-array` strategy remains in parity with the C++ version.
+*   **Large-scale benchmarks**: New tests will be added to validate the performance and scalability of the `heuristic` strategy on large datasets.

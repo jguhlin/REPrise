@@ -243,7 +243,7 @@ fn main() -> io::Result<()> {
     }
 
     // Use provided k or calculate default k like C++
-    let k = args.k.unwrap_or_else(|| default_k(data.sequence.len(), args.dist));
+    let k = args.k.unwrap_or_else(|| default_k(data.sequence.len(), args.dist).min(15));  // Limit for memory safety
     println!("kmer length: {}", k);
 
     // Build minimal index: suffix array + k-mer cache.

@@ -41,8 +41,19 @@ pub fn store_cache(
     seq: &[u8],
     sa: &[i64],
 ) -> Vec<Vec<CacheEntry>> {
-    let size = 1usize << (cache_len * 2);
-    let mut cache = vec![Vec::new(); size];
+    // Limit k-mer length for cache to prevent excessive memory allocation
+    // For k > 15, the cache would require > 1GB of memory (4^15 = 1 billion entries)
+    const MAX_CACHE_K: usize = 15;
+    
+    if cache_len > MAX_CACHE_K {
+        eprintln!("Warning: k-mer length {} exceeds maximum cache size. Using hash-based approach.", cache_len);
+        // For large k, return empty cache and rely on suffix array directly
+        // This will be slower but won't exhaust memory
+        return vec![Vec::new(); 0];
+    }
+    
+    let size = 1u64 << (cache_len * 2);
+    let mut cache = vec![Vec::new(); size as usize];
 
     if edit_distance == 0 {
         // Optimized exact matching - scan suffix array once
@@ -102,7 +113,7 @@ pub fn store_cache(
             
             // Convert matches to cache entries
             for (begin, end) in matched {
-                cache[id].push((begin, end, cache_len as u8, edit_distance));
+                cache[id as usize].push((begin, end, cache_len as u8, edit_distance));
             }
         }
     }

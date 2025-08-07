@@ -13,6 +13,14 @@ pub mod index;
 pub mod pipeline;
 pub mod memory_pool;
 pub mod alignment;
+pub mod streaming;
+
+// Production-grade modules (temporarily disabled for core testing)
+// pub mod config;
+// pub mod logging;
+// pub mod output;
+// pub mod recovery;
+// pub mod system;
 
 // Production-grade modules (temporarily disabled for core testing)
 // pub mod config;

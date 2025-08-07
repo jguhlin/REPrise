@@ -5,7 +5,7 @@
 //! It uses ahash for deterministic, high-performance hashing suitable for
 //! parallel processing pipelines.
 
-use crate::error::{RepriseError, Result};
+use crate::error::{REPriseError, Result};
 use crate::genome::Genome;
 use crate::memory_pool::PooledKmerBuffer;
 use ahash::{AHashMap, AHashSet};
@@ -45,14 +45,14 @@ impl Kmer {
     ///
     /// # Returns
     /// * `Ok(Kmer)` - Valid canonical k-mer
-    /// * `Err(RepriseError)` - Invalid sequence or k-mer parameters
+    /// * `Err(REPriseError)` - Invalid sequence or k-mer parameters
     pub fn from_sequence(seq: &[u8], k: usize) -> Result<Self> {
         if k < MIN_K || k > MAX_K {
-            return Err(RepriseError::invalid_kmer_length(k, MIN_K, MAX_K));
+            return Err(REPriseError::invalid_kmer_length(k, MIN_K, MAX_K));
         }
         
         if seq.len() != k {
-            return Err(RepriseError::config(format!(
+            return Err(REPriseError::config(format!(
                 "Sequence length {} does not match k-mer length {}",
                 seq.len(),
                 k
@@ -62,7 +62,7 @@ impl Kmer {
         // Check for ambiguous bases
         for (i, &base) in seq.iter().enumerate() {
             if base > 3 {
-                return Err(RepriseError::InvalidKmer(i as u64));
+                return Err(REPriseError::InvalidKmer(i as u64));
             }
         }
         
@@ -156,10 +156,10 @@ impl KmerEngine {
     ///
     /// # Returns
     /// * `Ok(KmerEngine)` - Successfully created engine
-    /// * `Err(RepriseError)` - Invalid k-mer length
+    /// * `Err(REPriseError)` - Invalid k-mer length
     pub fn new(k: usize) -> Result<Self> {
         if k < MIN_K || k > MAX_K {
-            return Err(RepriseError::invalid_kmer_length(k, MIN_K, MAX_K));
+            return Err(REPriseError::invalid_kmer_length(k, MIN_K, MAX_K));
         }
         
         // Use fixed seed for deterministic hashing with optimized parameters
@@ -240,10 +240,10 @@ impl KmerEngine {
     ///
     /// # Returns
     /// * `Ok(Vec<(u64, Kmer)>)` - Vector of (position, kmer) pairs
-    /// * `Err(RepriseError)` - Invalid range
+    /// * `Err(REPriseError)` - Invalid range
     pub fn extract_kmers_from_range(&self, genome: &Genome, start: u64, length: usize) -> Result<Vec<(u64, Kmer)>> {
         if start >= genome.len() {
-            return Err(RepriseError::invalid_range(start, start + length as u64));
+            return Err(REPriseError::invalid_range(start, start + length as u64));
         }
         
         // Constrain the range to genome bounds and handle contig boundaries gracefully
@@ -254,9 +254,9 @@ impl KmerEngine {
         let constrained_length = if !genome.is_within_one_contig(start, actual_length) {
             // Find the contig containing the start position
             let contig_id = genome.contig_of(start)
-                .ok_or_else(|| RepriseError::invalid_range(start, end))?;
+                .ok_or_else(|| REPriseError::invalid_range(start, end))?;
             let contig_info = genome.contig_info(contig_id)
-                .ok_or_else(|| RepriseError::ContigNotFound(contig_id))?;
+                .ok_or_else(|| REPriseError::ContigNotFound(contig_id))?;
             
             // Constrain to contig end
             let contig_end = contig_info.end;
@@ -323,13 +323,13 @@ impl KmerEngine {
 /// Each nucleotide uses 2 bits: A=00, C=01, G=10, T=11
 fn sequence_to_u64(seq: &[u8]) -> Result<u64> {
     if seq.len() > 32 {
-        return Err(RepriseError::config("Sequence too long for 64-bit representation".to_string()));
+        return Err(REPriseError::config("Sequence too long for 64-bit representation".to_string()));
     }
     
     let mut result = 0u64;
     for &nucleotide in seq {
         if nucleotide > 3 {
-            return Err(RepriseError::InvalidKmer(0)); // Position doesn't matter here
+            return Err(REPriseError::InvalidKmer(0)); // Position doesn't matter here
         }
         result = (result << 2) | (nucleotide as u64);
     }

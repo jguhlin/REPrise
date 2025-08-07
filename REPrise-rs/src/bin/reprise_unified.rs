@@ -205,7 +205,7 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     
-    let k = args.k.unwrap_or_else(|| default_k(data.sequence.len(), 0));
+    let k = args.k.unwrap_or_else(|| default_k(data.sequence.len(), 0).min(15));  // Limit for memory safety
     println!("Genome: {} bases, k-mer length: {}", data.sequence.len(), k);
     
     // Build suffix array and k-mer structures

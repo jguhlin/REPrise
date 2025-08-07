@@ -5,10 +5,13 @@
 //! concurrent genomic processing pipeline.
 
 use thiserror::Error;
+use crossbeam::channel::SendError;
+use rayon::ThreadPoolBuildError;
+use crate::pipeline::CandidatePair;
 
 /// Comprehensive error type for all REPrise operations
 #[derive(Error, Debug)]
-pub enum RepriseError {
+pub enum REPriseError {
     /// I/O errors (file operations, network, etc.)
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -60,13 +63,27 @@ pub enum RepriseError {
     /// Parse error for numeric or other structured data
     #[error("Parse error: {0}")]
     Parse(String),
+
+    #[error("Send error: {0}")]
+    SendError(#[from] SendError<CandidatePair>),
+
+    #[error("Thread pool build error: {0}")]
+    ThreadPoolBuildError(#[from] ThreadPoolBuildError),
+    
+    /// Thread join error
+    #[error("Thread error: {0}")]
+    ThreadError(String),
+    
+    /// Needletail parser error
+    #[error("FASTA/Q parsing error: {0}")]
+    NeedletailError(#[from] needletail::errors::ParseError),
     
     /// Generic anyhow error for complex nested errors
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 
-impl RepriseError {
+impl REPriseError {
     /// Create an InvalidFasta error with line number and message
     pub fn invalid_fasta(line: usize, message: impl Into<String>) -> Self {
         Self::InvalidFasta {
@@ -107,7 +124,7 @@ impl RepriseError {
 }
 
 /// Result type alias for REPrise operations
-pub type Result<T> = std::result::Result<T, RepriseError>;
+pub type Result<T> = std::result::Result<T, REPriseError>;
 
 #[cfg(test)]
 mod tests {
@@ -116,36 +133,36 @@ mod tests {
     
     #[test]
     fn test_error_display() {
-        let err = RepriseError::InvalidKmer(12345);
+        let err = REPriseError::InvalidKmer(12345);
         assert_eq!(err.to_string(), "Invalid k-mer containing non-ACGT base at position 12345");
         
-        let err = RepriseError::invalid_fasta(42, "Missing sequence header");
+        let err = REPriseError::invalid_fasta(42, "Missing sequence header");
         assert_eq!(err.to_string(), "Invalid FASTA format at line 42: Missing sequence header");
         
-        let err = RepriseError::invalid_kmer_length(50, 4, 32);
+        let err = REPriseError::invalid_kmer_length(50, 4, 32);
         assert_eq!(err.to_string(), "K-mer length 50 is invalid (must be between 4 and 32)");
     }
     
     #[test]
     fn test_error_from_io() {
         let io_err = io::Error::new(io::ErrorKind::NotFound, "File not found");
-        let reprise_err: RepriseError = io_err.into();
+        let reprise_err: REPriseError = io_err.into();
         
         match reprise_err {
-            RepriseError::Io(_) => (),
+            REPriseError::Io(_) => (),
             _ => panic!("Expected Io error"),
         }
     }
     
     #[test]
     fn test_helper_methods() {
-        let err = RepriseError::concurrency("Channel closed");
+        let err = REPriseError::concurrency("Channel closed");
         assert!(err.to_string().contains("Channel closed"));
         
-        let err = RepriseError::config("Invalid thread count");
+        let err = REPriseError::config("Invalid thread count");
         assert!(err.to_string().contains("Invalid thread count"));
         
-        let err = RepriseError::parse("Invalid number format");
+        let err = REPriseError::parse("Invalid number format");
         assert!(err.to_string().contains("Invalid number format"));
     }
 }

@@ -472,7 +472,7 @@ mod tests {
         
         // Create a valid consensus
         let consensus = ConsensusSequence {
-            sequence: vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3; 10], // 200 bp mixed
+            sequence: vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 10], // 200 bp mixed
             left_extension: vec![],
             seed_sequence: vec![0; 60],
             right_extension: vec![],

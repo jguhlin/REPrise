@@ -11,9 +11,10 @@ name = "reprise"
 path = "src/lib.rs"
 
 [dependencies]
-clap = { version = "4.4", features = ["derive"] }
-rayon = "1.7"
-suffix = "1.3.0"
+clap = { version = "4.5.4", features = ["derive"] }
+rayon = "1.10.0"
+suffix = "1.0.1"
+num_cpus = "1.16.0"
 # High-performance concurrency and data structures
 crossbeam = "0.8"
 crossbeam-channel = "0.5"
@@ -29,6 +30,10 @@ block-aligner = { version = "0.5", features = ["simd_avx2"] }
 indicatif = "0.17"
 # Optional high-performance allocator
 mimalloc = { version = "0.1", optional = true }
+# Memory-mapped files and disk-based storage
+memmap2 = "0.9"
+# Bloom filters for fast membership tests
+bloom = "0.3"
 
 # Production logging and monitoring
 tracing = "0.1"
@@ -77,6 +82,10 @@ path = "src/main_optimized.rs"
 [[bin]]
 name = "reprise-cpp-port"
 path = "src/bin/reprise_cpp_port.rs"
+
+[[bin]]
+name = "reprise-streaming"
+path = "src/bin/reprise_streaming.rs"
 
 [features]
 default = []

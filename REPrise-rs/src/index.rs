@@ -1,5 +1,5 @@
 //! Contig-by-contig k-mer indexing for large-scale genomic analysis
-//!
+//! 
 //! This module implements efficient k-mer indexing that processes genomes
 //! contig-by-contig to handle large, fragmented assemblies. It provides
 //! deterministic indexing suitable for concurrent repeat detection pipelines.
@@ -7,6 +7,7 @@
 use crate::error::Result;
 use crate::genome::{Genome, ContigId};
 use crate::kmer::{Kmer, KmerEngine};
+use crate::pipeline::CandidatePair;
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
 
@@ -56,20 +57,14 @@ impl Default for MemoryHints {
     }
 }
 
-/// Configuration for k-mer indexing
-#[derive(Debug, Clone)]
+/// K-mer index configuration
+#[derive(Clone)]
 pub struct IndexConfig {
-    /// K-mer length
     pub k: usize,
-    /// Minimum frequency threshold for k-mer inclusion
     pub min_frequency: u32,
-    /// Maximum frequency threshold (to filter highly repetitive k-mers)
     pub max_frequency: Option<u32>,
-    /// Whether to use parallel processing
     pub parallel: bool,
-    /// Maximum number of positions to store per k-mer (memory control)
     pub max_positions_per_kmer: usize,
-    /// Memory optimization hints
     pub memory_hints: MemoryHints,
 }
 
@@ -402,6 +397,11 @@ impl KmerIndex {
     pub fn config(&self) -> &IndexConfig {
         &self.config
     }
+
+    pub fn get_candidate_pairs(&self, _min_freq: u32, _max_freq: Option<u32>) -> Vec<CandidatePair> {
+        // Simplified logic for now
+        Vec::new()
+    }
     
     /// Estimate k-mer capacity requirements for efficient pre-allocation
     /// 
@@ -526,7 +526,7 @@ impl MemoryUsageBreakdown {
                 unit_idx += 1;
             }
             
-            format!("{:.2} {}", size, UNITS[unit_idx])
+            format!( "{:.2} {}", size, UNITS[unit_idx])
         }
         
         format!(
@@ -649,7 +649,9 @@ mod tests {
     fn create_test_genome(sequences: &[(&str, &str)]) -> Genome {
         let mut fasta_content = String::new();
         for (name, seq) in sequences {
-            fasta_content.push_str(&format!(">{}\n{}\n", name, seq));
+            fasta_content.push_str(&format!( ">{}
+{}
+", name, seq));
         }
         
         let mut file = NamedTempFile::new().unwrap();

@@ -5,7 +5,7 @@
 //! needletail crate for fast FASTA parsing and maintains contig boundaries
 //! for safe concurrent processing.
 
-use crate::error::{RepriseError, Result};
+use crate::error::{REPriseError, Result};
 use needletail::{parse_fastx_file, Sequence};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -79,7 +79,7 @@ impl Genome {
     ///
     /// # Returns
     /// * `Ok(Genome)` - Successfully loaded genome
-    /// * `Err(RepriseError)` - File I/O error, invalid FASTA, or genome too large
+    /// * `Err(REPriseError)` - File I/O error, invalid FASTA, or genome too large
     ///
     /// # Performance
     /// This function is optimized for large genomes and can handle files with
@@ -94,14 +94,14 @@ impl Genome {
         
         // Use needletail for high-performance FASTA parsing
         let mut reader = parse_fastx_file(path)
-            .map_err(|e| RepriseError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| REPriseError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         
         let mut current_pos = 0u64;
         let mut contig_id = 0u32;
         
         while let Some(record) = reader.next() {
             let record = record
-                .map_err(|e| RepriseError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+                .map_err(|e| REPriseError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
             
             // Extract contig name and clean it
             let raw_name = String::from_utf8_lossy(record.id());
@@ -117,7 +117,7 @@ impl Genome {
             
             // Check for genome size overflow
             if current_pos.saturating_add(seq_len) > MAX_GENOME_SIZE {
-                return Err(RepriseError::GenomeTooLarge(
+                return Err(REPriseError::GenomeTooLarge(
                     current_pos + seq_len,
                     MAX_GENOME_SIZE,
                 ));
@@ -138,7 +138,7 @@ impl Genome {
             
             // Check for duplicate contig names
             if name_to_id.contains_key(&name) {
-                return Err(RepriseError::invalid_fasta(
+                return Err(REPriseError::invalid_fasta(
                     contig_id as usize + 1,
                     format!("Duplicate contig name: {}", name),
                 ));
@@ -154,14 +154,14 @@ impl Genome {
             
             // Safety check for maximum number of contigs
             if contig_id == u32::MAX {
-                return Err(RepriseError::Config(
+                return Err(REPriseError::Config(
                     "Maximum number of contigs (4 billion) exceeded".to_string(),
                 ));
             }
         }
         
         if contigs.is_empty() {
-            return Err(RepriseError::invalid_fasta(0, "No valid sequences found in FASTA file"));
+            return Err(REPriseError::invalid_fasta(0, "No valid sequences found in FASTA file"));
         }
         
         // Shrink collections to actual size to free unused memory

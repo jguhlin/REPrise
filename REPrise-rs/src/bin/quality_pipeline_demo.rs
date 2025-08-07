@@ -26,7 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build k-mer candidates
     let dist0_cache = store_cache(0, k, &data.sequence, &sa);
     let kmers = build_sortedkmers(k, &data.sequence, &dist0_cache, &sa, 3);
-    println!("Initial k-mer candidates: {} (demonstrates the '1000+' problem)", kmers.len());
+    let initial_kmer_count = kmers.len();
+    println!("Initial k-mer candidates: {} (demonstrates the '1000+' problem)", initial_kmer_count);
     
     // Initialize quality pipeline with C++ equivalent parameters
     let quality_params = QualityParams {
@@ -58,45 +59,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut processed_count = 0;
     
     println!("Processing candidates through quality pipeline...");
-    
-    // Process a sample of candidates to demonstrate filtering
+
     let sample_size = std::cmp::min(100, kmers.len());
-    for i in 0..sample_size {
+    let mut processed_count = 0;
+    for (frequency, kmer_data) in kmers.into_iter().take(sample_size) {
         processed_count += 1;
-        
-        if let Some((frequency, kmer_data)) = kmers.get(i) {
-            // Create mock positions and reverse flags for demonstration
-            let positions = vec![i * 100, i * 100 + 50]; // Mock positions
-            let rev_flags = vec![false, true]; // Mock reverse flags
-            
-            // Process through quality pipeline (with error handling for demo)
-            match quality_pipeline.process_candidate_kmer(
-                &kmer_data, &positions, &rev_flags, &data.sequence, &mut mask, &quality_params
-            ) {
-                Ok(Some(validated_family)) => {
-                    println!("✓ Family {}: Quality {:.3}, Length {}bp", 
-                             validated_family.family_id, 
-                             validated_family.quality.composite_score,
-                             validated_family.consensus.length);
-                    validated_families.push(validated_family);
-                    
-                    if validated_families.len() >= quality_params.max_families {
-                        println!("Reached target family limit: {}", quality_params.max_families);
-                        break;
-                    }
+
+        // Create mock positions and reverse flags for demonstration
+        let positions = vec![processed_count * 100, processed_count * 100 + 50]; // Mock positions
+        let rev_flags = vec![false, true]; // Mock reverse flags
+
+        // Process through quality pipeline (with error handling for demo)
+        match quality_pipeline.process_candidate_kmer(
+            &kmer_data, &positions, &rev_flags, &data.sequence, &mut mask, &quality_params
+        ) {
+            Ok(Some(validated_family)) => {
+                println!("✓ Family {}: Quality {:.3}, Length {}bp",
+                         validated_family.family_id,
+                         validated_family.quality.composite_score,
+                         validated_family.consensus.length);
+                validated_families.push(validated_family);
+
+                if validated_families.len() >= quality_params.max_families {
+                    println!("Reached target family limit: {}", quality_params.max_families);
+                    break;
                 }
-                Ok(None) => {
-                    // Filtered out - this is the key quality behavior
-                }
-                Err(e) => {
-                    // Expected during demo with mock data
-                    if processed_count <= 5 {
-                        println!("ⓘ Demo processing (expected with mock data): {}", e);
-                    }
+            }
+            Ok(None) => {
+                // Filtered out - this is the key quality behavior
+            }
+            Err(e) => {
+                // Expected during demo with mock data
+                if processed_count <= 5 {
+                    println!("ⓘ Demo processing (expected with mock data): {}", e);
                 }
             }
         }
-        
+
         // Early termination check
         if quality_pipeline.should_terminate() && validated_families.len() >= 20 {
             println!("✓ Quality plateau detected - early termination activated");
@@ -109,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Results summary
     println!();
     println!("=== QUALITY PIPELINE RESULTS ===");
-    println!("Initial candidates: {}", kmers.len());
+    println!("Initial candidates: {}", initial_kmer_count);
     println!("Processed candidates: {}", processed_count);
     println!("High-quality families: {}", validated_families.len());
     println!("Filter efficiency: {:.1}%", 

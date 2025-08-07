@@ -69,7 +69,7 @@ fn main() -> Result<()> {
     // Phase 1: Create atomic bitmask for thread-safe region tracking
     println!("\n3. Initializing atomic bitmask...");
     let mask = Arc::new(Bitmask::new(genome.len()));
-    println!("   Mask initialized for {} bases", mask.len());
+    println!("   Mask initialized for {} bases", genome.len());
     
     // Phase 3: Configure and run the pipeline
     println!("\n4. Configuring pipeline...");
