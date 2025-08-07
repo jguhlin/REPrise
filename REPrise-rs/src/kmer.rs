@@ -7,6 +7,7 @@
 
 use crate::error::{RepriseError, Result};
 use crate::genome::Genome;
+use crate::memory_pool::PooledKmerBuffer;
 use ahash::{AHashMap, AHashSet};
 use std::hash::{Hash, Hasher};
 
@@ -17,7 +18,14 @@ pub const MAX_K: usize = 32;
 pub const MIN_K: usize = 4;
 
 /// Fixed seed for deterministic hashing across runs
+/// This seed is chosen for good distribution properties with genomic k-mer data
 const HASH_SEED: usize = 0x51f3b5b8;
+
+/// Additional seed for secondary hash functions to reduce collisions
+const HASH_SEED2: u64 = 0x9e3779b9;
+
+/// Load factor for hash maps optimized for genomic data patterns
+const OPTIMAL_LOAD_FACTOR: f64 = 0.7;
 
 /// A k-mer represented as a 64-bit integer for efficient operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,9 +112,28 @@ impl Kmer {
 
 impl Hash for Kmer {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        // Optimized hashing for k-mers that provides good distribution
+        // Use the canonical representation as primary hash input
         self.canonical.hash(state);
+        // Include k-mer length to distinguish k-mers of different lengths
         self.k.hash(state);
     }
+}
+
+/// Fast hash implementation specifically optimized for k-mer canonical values
+/// This provides better performance for k-mer-heavy operations
+fn fast_kmer_hash(canonical: u64, k: usize) -> u64 {
+    // Use a fast mixing function optimized for 64-bit integers
+    let mut hash = canonical;
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ceb9fe1a85ec53);
+    hash ^= hash >> 33;
+    
+    // Mix in the k-mer length
+    hash ^= (k as u64).wrapping_mul(HASH_SEED2);
+    hash
 }
 
 /// High-performance k-mer indexing engine
@@ -135,8 +162,8 @@ impl KmerEngine {
             return Err(RepriseError::invalid_kmer_length(k, MIN_K, MAX_K));
         }
         
-        // Use fixed seed for deterministic hashing
-        let hasher_builder = ahash::RandomState::with_seed(HASH_SEED);
+        // Use fixed seed for deterministic hashing with optimized parameters
+        let hasher_builder = ahash::RandomState::with_seeds(HASH_SEED as u64, HASH_SEED2, 0, 0);
         
         Ok(KmerEngine {
             k,
@@ -144,7 +171,7 @@ impl KmerEngine {
         })
     }
     
-    /// Extract all k-mers from a genomic sequence
+    /// Extract all k-mers from a genomic sequence using memory pooling for better performance
     ///
     /// # Arguments
     /// * `sequence` - Genomic sequence in numeric format
@@ -156,7 +183,9 @@ impl KmerEngine {
             return Vec::new();
         }
         
-        let mut kmers = Vec::new();
+        // Use pooled buffer for better memory efficiency
+        let estimated_kmers = sequence.len().saturating_sub(self.k - 1);
+        let mut pooled_buffer = PooledKmerBuffer::with_capacity(estimated_kmers);
         
         for i in 0..=sequence.len() - self.k {
             let subseq = &sequence[i..i + self.k];
@@ -167,11 +196,39 @@ impl KmerEngine {
             }
             
             if let Ok(kmer) = Kmer::from_sequence(subseq, self.k) {
-                kmers.push(kmer);
+                pooled_buffer.push(kmer);
             }
         }
         
-        kmers
+        // Convert back to owned Vec - the pooled buffer will be reused after this function
+        pooled_buffer.as_ref().clone()
+    }
+    
+    /// Extract k-mers from a sequence into a provided buffer for zero-allocation usage
+    /// This is the most memory-efficient variant for repeated operations
+    pub fn extract_kmers_into_buffer(&self, sequence: &[u8], buffer: &mut Vec<Kmer>) {
+        buffer.clear();
+        
+        if sequence.len() < self.k {
+            return;
+        }
+        
+        // Pre-allocate based on sequence length
+        let estimated_kmers = sequence.len().saturating_sub(self.k - 1);
+        buffer.reserve(estimated_kmers);
+        
+        for i in 0..=sequence.len() - self.k {
+            let subseq = &sequence[i..i + self.k];
+            
+            // Skip k-mers with ambiguous bases
+            if subseq.iter().any(|&b| b > 3) {
+                continue;
+            }
+            
+            if let Ok(kmer) = Kmer::from_sequence(subseq, self.k) {
+                buffer.push(kmer);
+            }
+        }
     }
     
     /// Extract k-mers from a specific genomic range
@@ -183,18 +240,33 @@ impl KmerEngine {
     ///
     /// # Returns
     /// * `Ok(Vec<(u64, Kmer)>)` - Vector of (position, kmer) pairs
-    /// * `Err(RepriseError)` - Invalid range or boundary violation
+    /// * `Err(RepriseError)` - Invalid range
     pub fn extract_kmers_from_range(&self, genome: &Genome, start: u64, length: usize) -> Result<Vec<(u64, Kmer)>> {
-        if start + length as u64 > genome.len() {
+        if start >= genome.len() {
             return Err(RepriseError::invalid_range(start, start + length as u64));
         }
         
-        // Check if the range crosses contig boundaries
-        if !genome.is_within_one_contig(start, length) {
-            return Err(RepriseError::BoundaryViolation);
-        }
+        // Constrain the range to genome bounds and handle contig boundaries gracefully
+        let end = (start + length as u64).min(genome.len());
+        let actual_length = (end - start) as usize;
         
-        let sequence = genome.slice(start..start + length as u64);
+        // If the range crosses contig boundaries, constrain to the current contig
+        let constrained_length = if !genome.is_within_one_contig(start, actual_length) {
+            // Find the contig containing the start position
+            let contig_id = genome.contig_of(start)
+                .ok_or_else(|| RepriseError::invalid_range(start, end))?;
+            let contig_info = genome.contig_info(contig_id)
+                .ok_or_else(|| RepriseError::ContigNotFound(contig_id))?;
+            
+            // Constrain to contig end
+            let contig_end = contig_info.end;
+            let constrained_end = end.min(contig_end);
+            (constrained_end - start) as usize
+        } else {
+            actual_length
+        };
+        
+        let sequence = genome.slice(start..start + constrained_length as u64);
         let mut result = Vec::new();
         
         if sequence.len() < self.k {
@@ -222,9 +294,23 @@ impl KmerEngine {
         AHashMap::with_hasher(self.hasher_builder.clone())
     }
     
+    /// Create a deterministic hash map with pre-allocated capacity
+    /// This reduces reallocations during indexing for better performance
+    pub fn new_kmer_map_with_capacity<V>(&self, capacity: usize) -> AHashMap<Kmer, V> {
+        // Adjust capacity based on optimal load factor for genomic data
+        let adjusted_capacity = ((capacity as f64) / OPTIMAL_LOAD_FACTOR).ceil() as usize;
+        AHashMap::with_capacity_and_hasher(adjusted_capacity, self.hasher_builder.clone())
+    }
+    
     /// Create a deterministic hash set for k-mer tracking
     pub fn new_kmer_set(&self) -> AHashSet<Kmer> {
         AHashSet::with_hasher(self.hasher_builder.clone())
+    }
+    
+    /// Create a deterministic hash set with pre-allocated capacity
+    pub fn new_kmer_set_with_capacity(&self, capacity: usize) -> AHashSet<Kmer> {
+        let adjusted_capacity = ((capacity as f64) / OPTIMAL_LOAD_FACTOR).ceil() as usize;
+        AHashSet::with_capacity_and_hasher(adjusted_capacity, self.hasher_builder.clone())
     }
     
     /// Get the k-mer length for this engine
@@ -294,10 +380,15 @@ impl KmerFrequency {
         Ok(KmerFrequency { engine, counts })
     }
     
-    /// Count k-mers in a sequence
+    /// Count k-mers in a sequence using memory pooling for efficiency
     pub fn count_sequence(&mut self, sequence: &[u8]) {
-        let kmers = self.engine.extract_kmers(sequence);
-        for kmer in kmers {
+        // Use a reusable buffer to minimize allocations
+        let estimated_kmers = sequence.len().saturating_sub(self.engine.k().saturating_sub(1));
+        let mut pooled_buffer = PooledKmerBuffer::with_capacity(estimated_kmers);
+        
+        self.engine.extract_kmers_into_buffer(sequence, pooled_buffer.as_mut());
+        
+        for &kmer in pooled_buffer.as_ref() {
             *self.counts.entry(kmer).or_insert(0) += 1;
         }
     }

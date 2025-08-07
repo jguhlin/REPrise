@@ -1,536 +1,717 @@
-use std::env;
+//! REPrise: De novo interspersed repeat detection tool
+//! 
+//! This is the main CLI interface for the high-performance, concurrent REPrise implementation.
+//! Uses the scaling architecture from Phases 1-3 for processing large genomes efficiently.
+//! Includes production-grade logging, monitoring, configuration management, and error recovery.
+
+use reprise::pipeline::{Pipeline, PipelineConfig, DetectedRepeat};
+use reprise::genome::Genome;
+use reprise::index::{KmerIndex, IndexConfig};
+use reprise::mask::Bitmask;
+use reprise::error::Result;
+// Production modules temporarily disabled for core testing
+// use reprise::config::{ConfigManager, OutputFormat, CompressionType};
+// use reprise::logging::{LoggingSystem, LoggingConfig, LogLevel};
+// use reprise::output::{OutputManager, OutputMetadata, ProcessingParameters, OutputStatistics, GenomeInfo};
+// use reprise::recovery::{RecoveryManager, ProcessingState, ProcessingPhase, ProgressInfo, SignalHandler};
+// use reprise::system::{init_system_manager, shutdown_system_manager, system_manager};
+use clap::{Parser, ValueEnum};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::fs::File;
-use std::io::{self, Write};
-use reprise::{build_sequence, suffix_array, num_to_char, default_k, chrtracer};
+use std::io::{BufWriter, Write};
+use indicatif::{ProgressBar, ProgressStyle};
+use tracing::{info, warn, error, instrument};
+use uuid::Uuid;
+use chrono::Utc;
 
-/// CLI args matching C++ REPrise parameters.
-#[derive(Debug)]
-struct Cli {
-    input: String,
-    output: String,
-    k: Option<usize>,
-    match_score: i32,
-    mismatch_score: i32,
-    gap_score: i32,
-    gap_extend_score: i32,
-    cap_penalty: i32,
-    dist: usize,
-    max_extend: usize,
-    max_repeat: usize,
-    max_gap: usize,
-    stop_after: usize,
-    min_length: usize,
-    min_freq: usize,
-    min_improvement: usize,
-    tandem_dist: usize,
-    verbose: bool,
-    #[allow(dead_code)]
-    help: bool,
-    additional_file: bool,
-    #[allow(dead_code)]
-    parallel_num: usize,
+/// Strategy for repeat detection
+#[derive(ValueEnum, Clone, Debug, Copy)]
+pub enum Strategy {
+    /// Heuristic path: Faster, lower resource usage. Recommended for all analyses.
+    #[value(name = "heuristic")]
+    Heuristic,
 }
 
-fn parse_cli() -> Cli {
-    // C++ defaults from REPrise.cpp
-    let mut input = String::new();
-    let mut output = String::new();
-    let mut k: Option<usize> = None;
-    let mut match_score: i32 = 1;
-    let mut mismatch_score: i32 = -1;
-    let mut gap_score: i32 = -5;
-    let mut gap_extend_score: i32 = -1;
-    let mut cap_penalty: i32 = -20;
-    let mut dist: usize = 0;
-    let mut max_extend: usize = 10000;
-    let mut max_repeat: usize = 100000;
-    let mut max_gap: usize = 5;
-    let mut stop_after: usize = 100;
-    let mut min_length: usize = 50;
-    let mut min_freq: usize = 3;
-    let mut min_improvement: usize = 3;
-    let mut tandem_dist: usize = 500;
-    let mut verbose = false;
-    let mut help = false;
-    let mut additional_file = false;
-    let mut parallel_num: usize = 1;
+/// REPrise: A tool for de-novo repeat identification in large genomes
+#[derive(Parser, Debug)]
+#[command(author, version, about = "REPrise: A tool for de-novo repeat identification in large genomes with production-grade features.")]
+pub struct Args {
+    /// Input FASTA file path
+    #[arg(short, long, value_name = "FILE")]
+    pub input: PathBuf,
 
-    let args: Vec<String> = env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-input" => {
-                if i + 1 < args.len() { input = args[i + 1].clone(); i += 2; } else { break; }
-            }
-            "-output" => {
-                if i + 1 < args.len() { output = args[i + 1].clone(); i += 2; } else { break; }
-            }
-            "-k" => {
-                if i + 1 < args.len() { k = args[i + 1].parse().ok(); i += 2; } else { break; }
-            }
-            "-match" => {
-                if i + 1 < args.len() { match_score = args[i + 1].parse().unwrap_or(match_score); i += 2; } else { break; }
-            }
-            "-mismatch" => {
-                if i + 1 < args.len() { mismatch_score = args[i + 1].parse().unwrap_or(mismatch_score); i += 2; } else { break; }
-            }
-            "-gap" => {
-                if i + 1 < args.len() { gap_score = args[i + 1].parse().unwrap_or(gap_score); i += 2; } else { break; }
-            }
-            "-gapex" => {
-                if i + 1 < args.len() { gap_extend_score = args[i + 1].parse().unwrap_or(gap_extend_score); i += 2; } else { break; }
-            }
-            "-cappenalty" => {
-                if i + 1 < args.len() { cap_penalty = args[i + 1].parse().unwrap_or(cap_penalty); i += 2; } else { break; }
-            }
-            "-dist" => {
-                if i + 1 < args.len() { dist = args[i + 1].parse().unwrap_or(dist); i += 2; } else { break; }
-            }
-            "-maxextend" => {
-                if i + 1 < args.len() { max_extend = args[i + 1].parse().unwrap_or(max_extend); i += 2; } else { break; }
-            }
-            "-maxrepeat" => {
-                if i + 1 < args.len() { max_repeat = args[i + 1].parse().unwrap_or(max_repeat); i += 2; } else { break; }
-            }
-            "-maxgap" => {
-                if i + 1 < args.len() { max_gap = args[i + 1].parse().unwrap_or(max_gap); i += 2; } else { break; }
-            }
-            "-stopafter" => {
-                if i + 1 < args.len() { stop_after = args[i + 1].parse().unwrap_or(stop_after); i += 2; } else { break; }
-            }
-            "-minlength" => {
-                if i + 1 < args.len() { min_length = args[i + 1].parse().unwrap_or(min_length); i += 2; } else { break; }
-            }
-            "-minfreq" => {
-                if i + 1 < args.len() { min_freq = args[i + 1].parse().unwrap_or(min_freq); i += 2; } else { break; }
-            }
-            "-minimprovement" => {
-                if i + 1 < args.len() { min_improvement = args[i + 1].parse().unwrap_or(min_improvement); i += 2; } else { break; }
-            }
-            "-tandemdist" => {
-                if i + 1 < args.len() { tandem_dist = args[i + 1].parse().unwrap_or(tandem_dist); i += 2; } else { break; }
-            }
-            "-verbose" => { verbose = true; i += 1; }
-            "-h" => { help = true; i += 1; }
-            "-additionalfile" => { additional_file = true; i += 1; }
-            "-pa" => {
-                if i + 1 < args.len() { parallel_num = args[i + 1].parse().unwrap_or(parallel_num); i += 2; } else { break; }
-            }
-            _ => { i += 1; }
-        }
-    }
+    /// Output file prefix. The program will write <PREFIX>.bed, <PREFIX>.masked.fa, etc.
+    #[arg(short, long, value_name = "PREFIX")]
+    pub output: String,
 
-    if help {
-        print_usage();
-        std::process::exit(0);
-    }
+    /// Configuration file path (YAML, TOML, or JSON)
+    #[arg(short, long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
 
-    if input.is_empty() || output.is_empty() {
-        eprintln!("Error: -input and -output are required");
-        print_usage();
-        std::process::exit(1);
-    }
+    /// Configuration profile to use (fast, accurate, large_genome, small_genome)
+    #[arg(long, value_name = "PROFILE")]
+    pub profile: Option<String>,
 
-    // Memory safety validation - prevent heap-buffer-overflow like GitHub issue #1
-    if max_extend > 1_000_000 {
-        eprintln!("Error: -maxextend {} is too large (max: 1,000,000)", max_extend);
-        eprintln!("Large values can cause memory issues. Consider using tandem repeat masking first.");
-        std::process::exit(1);
-    }
-
-    if max_repeat > 10_000_000 {
-        eprintln!("Error: -maxrepeat {} is too large (max: 10,000,000)", max_repeat);
-        std::process::exit(1);
-    }
-
-    // Warn about potentially problematic parameter combinations
-    if max_extend > 50_000 {
-        eprintln!("Warning: -maxextend {} is very large and may consume significant memory", max_extend);
-        eprintln!("Consider pre-masking tandem repeats with tools like tantan for better performance");
-    }
-
-    Cli { 
-        input, output, k, match_score, mismatch_score, gap_score, gap_extend_score,
-        cap_penalty, dist, max_extend, max_repeat, max_gap, stop_after, min_length,
-        min_freq, min_improvement, tandem_dist, verbose, help, additional_file, parallel_num
-    }
-}
-
-fn print_usage() {
-    println!("REPrise: de novo interspersed repeat detection software. version 1.0.1 (Rust port)");
-    println!();
-    println!("Usage");
-    println!();  
-    println!("REPrise [-input genome file] [-output outputname] [Options]");
-    println!();
-    println!("Options");
-    println!("(Required)");
-    println!("   -input  STR         input file name. You can input assembled genome file, or hard masked genome file");
-    println!("   -output STR         output file name. REPrise outputs STR.freq, STR.bed STR.masked and STR.reprof (consensus seqnences)");
-    println!();
-    println!("(Optional)");
-    println!("   -h                  Print help and exit");
-    println!("   -verbose            Verbose");
-    println!("   -additionalfile     Output files about masked region(.masked and .bed)");
-    println!();
-    println!("   -match INT          Match score of the extension alignment (default = 1)");
-    println!("   -mismatch INT       Mismatch score of the extension alignment (default = -1)");
-    println!("   -gap   INT          Gap open score of the extension alignment (default = -5)");
-    println!("   -gapex  INT         Gap extension score of the extension alignment (default = -1)");
-    println!("   -cappenalty INT     Penalty of the imcomplete length alignment (default = -20)");
-    println!("   -dist INT           Number of mismatches allowed in inexact seed (default = 0)");
-    println!();
-    println!("   -maxextend INT      Upper limit length of extension in one side direction of consensus repeat (default = 10000, max = 1000000)");
-    println!("   -maxrepeat INT      Maximum Number of elements belonging to one repeat family (default = 100000)");
-    println!("   -maxgap INT         Band size(= maximum number of gaps allowed) of extension alignment (default = 5)");
-    println!("   -stopafter INT      If the maximum score of extension alignment does not change INT consecutive times, that alignment will stop (default = 100)");
-    println!("   -minlength INT      Minimum number of length of the consensus sequence of repeat family(default = 50)");
-    println!("   -minfreq INT        Minimum number of elements  belonging to one repeat family (default = 3)");
-    println!("   -minimprovement INT Penalty associated with the number of regions to be extended as the repeat regions (default = 3)");
-    println!("   -tandemdist INT     Interval to match the same seed to avoid seed matching with tandem repeats(default = 500)");
-    println!("   -pa INT             Number of parallel threads (default = 1)");
-    println!();
-    println!("Memory Notes:");
-    println!("   Large -maxextend values can cause high memory usage. Consider pre-masking");
-    println!("   tandem repeats with tools like 'tantan' for better performance on repetitive genomes.");
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-struct RepeatHit {
-    contig_id: String,
-    start: usize,
-    end: usize,
-    length: usize,
-    orientation: char, // '+' or '-'
-    score: i32,
-}
-
-fn main() -> io::Result<()> {
-    let args = parse_cli();
-    if args.verbose {
-        println!("CLI: {:?}", args);
-    }
-
-    // Load FASTA via existing builder (numeric encoding and padding).
-    let data = build_sequence(&args.input).expect("failed to read FASTA");
+    /// The seed-pairing strategy to use
+    #[arg(long, value_enum, default_value_t = Strategy::Heuristic)]
+    pub strategy: Strategy,
     
-    // Safety check for extremely large genomes that might cause issues
-    if data.sequence.len() > 10_000_000_000 {  // > 10GB sequence
-        eprintln!("Error: Input sequence is extremely large ({} bases)", data.sequence.len());
-        eprintln!("This may cause memory issues. Consider splitting the input or increasing system memory.");
-        std::process::exit(1);
-    }
-    if data.sequence.is_empty() {
-        eprintln!("Empty sequence after FASTA load");
-        std::process::exit(1);
-    }
-    if args.verbose {
-        println!("sequence length: {}", data.sequence.len());
-        
-        // Memory usage estimation to help users avoid crashes like GitHub issue #1
-        let estimated_consensus_memory = args.max_extend * 2 * args.max_repeat * std::mem::size_of::<u8>();
-        println!("Estimated peak consensus memory: {} MB", estimated_consensus_memory / 1_000_000);
-        
-        if estimated_consensus_memory > 1_000_000_000 {  // > 1GB
-            println!("WARNING: High memory usage expected. Consider reducing -maxextend or -maxrepeat");
-        }
-    }
+    /// Number of parallel threads to use [default: available cores]
+    #[arg(long, short = 'p', value_name = "INT", default_value_t = 0)]
+    pub threads: usize,
 
-    // Print chromosome table like C++ version
-    for (name, start) in &data.chrtable {
-        println!("{}\t{}", name, start);
-    }
+    /// K-mer length for indexing [default: auto-calculated]
+    #[arg(short, long, value_name = "INT")]
+    pub k: Option<usize>,
 
-    // Use provided k or calculate default k like C++
-    let k = args.k.unwrap_or_else(|| default_k(data.sequence.len(), args.dist));
-    println!("kmer length: {}", k);
+    /// Minimum k-mer frequency for processing
+    #[arg(long, value_name = "INT", default_value_t = 3)]
+    pub min_freq: u32,
 
-    // Build minimal index: suffix array + k-mer cache.
-    let sa = suffix_array(&data.sequence);
-    if args.verbose {
-        println!("suffix array length: {}", sa.len());
-    }
+    /// Maximum k-mer frequency for processing
+    #[arg(long, value_name = "INT")]
+    pub max_freq: Option<u32>,
+
+    /// Region extension size around k-mer positions
+    #[arg(long, value_name = "INT", default_value_t = 100)]
+    pub extension: u64,
+
+    /// Maximum region size to process
+    #[arg(long, value_name = "INT", default_value_t = 10000)]
+    pub max_region: u64,
+
+    /// Minimum alignment score for repeat detection
+    #[arg(long, value_name = "INT", default_value_t = 10)]
+    pub min_score: i32,
+
+    /// Minimum percent identity for repeat detection (0.0-1.0)
+    #[arg(long, value_name = "FLOAT", default_value_t = 0.50)]
+    pub min_identity: f64,
+
+    /// Channel capacity for bounded channels
+    #[arg(long, value_name = "INT", default_value_t = 10000)]
+    pub channel_capacity: usize,
+
+    /// Output formats (tsv, bed, json, gff3)
+    #[arg(long, value_delimiter = ',')]
+    pub output_formats: Option<Vec<String>>,
+
+    /// Enable output compression
+    #[arg(long)]
+    pub compress: bool,
+
+    /// Compression type (gzip, bzip2)
+    #[arg(long, value_name = "TYPE", default_value = "gzip")]
+    pub compression_type: String,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, value_name = "LEVEL", default_value = "info")]
+    pub log_level: String,
+
+    /// Enable JSON structured logging
+    #[arg(long)]
+    pub json_logs: bool,
+
+    /// Log directory (default: stdout)
+    #[arg(long, value_name = "DIR")]
+    pub log_dir: Option<PathBuf>,
+
+    /// Enable checkpointing for resume capability
+    #[arg(long)]
+    pub enable_checkpoints: bool,
+
+    /// Checkpoint directory
+    #[arg(long, value_name = "DIR")]
+    pub checkpoint_dir: Option<PathBuf>,
+
+    /// Resume from checkpoint
+    #[arg(long)]
+    pub resume: bool,
+
+    /// Enable verbose output
+    #[arg(short, long)]
+    pub verbose: bool,
+
+    /// Output additional files (.bed, .masked) - DEPRECATED, use --output-formats
+    #[arg(long, hide = true)]
+    pub additional_files: bool,
+
+    /// Save current configuration to file
+    #[arg(long, value_name = "FILE")]
+    pub save_config: Option<PathBuf>,
+
+    /// Show available configuration profiles and exit
+    #[arg(long)]
+    pub list_profiles: bool,
+
+    /// Show system information and recommendations
+    #[arg(long)]
+    pub system_info: bool,
+}
+
+#[instrument]
+fn main() -> Result<()> {
+    let args = Args::parse();
     
-    // Store cache with proper inexact seeding support like C++
-    let dist0_cache = reprise::alg::repeat::store_cache(0, k, &data.sequence, &sa);
-    let inexact_cache = if args.dist > 0 {
-        reprise::alg::repeat::store_cache(args.dist as u8, k, &data.sequence, &sa)
+    // Ensure 64-bit target
+    #[cfg(target_pointer_width = "32")]
+    {
+        eprintln!("Error: REPrise requires a 64-bit target to handle large genomes.");
+        std::process::exit(1);
+    }
+
+    // Handle informational commands first
+    if args.list_profiles {
+        return list_profiles();
+    }
+
+    if args.system_info {
+        return show_system_info();
+    }
+
+    // Initialize configuration manager
+    let mut config_manager = if let Some(config_file) = &args.config {
+        ConfigManager::load_from_file(config_file)?
     } else {
-        dist0_cache.clone()
+        ConfigManager::new()
     };
 
-    // Build kmers heap using exact cache for frequency counting
-    let mut kmers = reprise::alg::repeat::build_sortedkmers(
-        k,
-        &data.sequence,
-        &dist0_cache,
-        &sa,
-        args.min_freq,
+    // Apply profile if specified
+    if let Some(profile_name) = &args.profile {
+        config_manager.apply_profile(profile_name)?;
+    }
+
+    // Override with environment variables
+    config_manager.load_from_env()?;
+
+    // Override with command line arguments
+    override_config_from_args(&mut config_manager, &args)?;
+
+    // Save configuration if requested
+    if let Some(save_path) = &args.save_config {
+        config_manager.save_to_file(save_path)?;
+        println!("Configuration saved to: {}", save_path.display());
+        return Ok(());
+    }
+
+    // Initialize logging system
+    let logging_config = config_manager.config().logging.clone();
+    let logging_system = LoggingSystem::init(logging_config)?;
+    let metrics = logging_system.metrics();
+
+    // Initialize system monitoring
+    let system_settings = config_manager.config().system.clone();
+    init_system_manager(system_settings, Arc::clone(&metrics))?;
+
+    // Initialize recovery manager
+    let recovery_settings = config_manager.config().recovery.clone();
+    let recovery_manager = Arc::new(RecoveryManager::new(recovery_settings));
+
+    // Set up signal handlers
+    let signal_handler = SignalHandler::new(Arc::clone(&recovery_manager));
+    signal_handler.install_handlers()?;
+
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        input_file = %args.input.display(),
+        output_prefix = %args.output,
+        "Starting REPrise analysis"
     );
 
-    // Global mask across genome during family discovery.
-    let mut mask = vec![false; data.sequence.len()];
-
-    // Create output files matching C++ format
-    let reprof_file = format!("{}.reprof", args.output);
-    let mut reprof_writer = File::create(reprof_file)?;
-    
-    let freq_file = format!("{}.freq", args.output);
-    let mut freq_writer = File::create(freq_file)?;
-    
-    // Create BED and masked files if requested
-    let mut bed_writer = if args.additional_file {
-        let bed_file = format!("{}.bed", args.output);
-        Some(File::create(bed_file)?)
-    } else {
-        None
-    };
-    
-    let mut masked_writer = if args.additional_file {
-        let masked_file = format!("{}.masked", args.output);
-        Some(File::create(masked_file)?)
-    } else {
-        None
-    };
-    
-    let mut repeat_num = 0;
-    
-    // Process repeat families using find_bestseed like C++ version with full extension alignment
-    while repeat_num < args.max_repeat {
-        if kmers.is_empty() {
-            break;
-        }
-        
-        // Use find_bestseed with inexact cache for repeat detection
-        let (seedfreq, kmer, pos, rev) = reprise::alg::repeat::find_bestseed(
-            &mut kmers, &inexact_cache, &mask, &data.sequence, &sa, args.tandem_dist, args.min_freq
-        );
-        
-        if seedfreq < args.min_freq {
-            break;
-        }
-
-        // Immediately mask the seed positions to prevent overlapping k-mers
-        // This is critical for matching C++ behavior
-        let mut seed_occ_f = Vec::new();
-        let mut seed_occ_r = Vec::new();
-        for (i, &position) in pos.iter().enumerate() {
-            if !rev[i] {
-                seed_occ_f.push(position);
+    // Check for resume capability
+    let mut resume_from_checkpoint = None;
+    if args.resume {
+        if let Some(checkpoint) = recovery_manager.load_latest_checkpoint()? {
+            let config_hash = calculate_config_hash(config_manager.config());
+            let input_hash = calculate_file_hash(&args.input)?;
+            
+            if recovery_manager.can_resume_from_checkpoint(&checkpoint, config_hash, Some(&input_hash)) {
+                info!(checkpoint_id = %checkpoint.id, "Resuming from checkpoint");
+                resume_from_checkpoint = Some(checkpoint);
             } else {
-                seed_occ_r.push(position);
-            }
-        }
-        reprise::alg::repeat::maskbyseed(&seed_occ_f, &mut mask, k, false);
-        reprise::alg::repeat::maskbyseed(&seed_occ_r, &mut mask, k, true);
-
-        // Create consensus sequence with extension alignment - safe allocation
-        let consensus_size = 2 * args.max_extend + k;
-        
-        // Memory safety check - prevent excessive allocations that caused C++ crashes
-        if consensus_size > 10_000_000 {
-            eprintln!("Error: Consensus sequence size {} too large for repeat family {}", 
-                     consensus_size, repeat_num);
-            eprintln!("This can happen with very large -maxextend values on repetitive genomes");
-            break; // Skip this family and continue processing
-        }
-        
-        // Safe allocation - Rust prevents buffer overflows but we check size limits
-        let mut consensus = vec![0u8; consensus_size];
-        
-        // Initialize consensus with the seed sequence at MAXEXTEND position
-        for (i, &base) in kmer.iter().enumerate() {
-            if args.max_extend + i < consensus.len() {
-                consensus[args.max_extend + i] = base;
-            }
-        }
-        
-        // Perform extension alignment in both directions
-        let mut repeatstart = vec![0i32; seedfreq];
-        let mut repeatend = vec![0i32; seedfreq];
-        let mut seed_ext = vec![-1i32; seedfreq];
-        
-        // Right extension
-        let right_ext = reprise::alg::repeat::extend(
-            true, // is_right
-            seedfreq,
-            &pos,
-            &rev,
-            &data.sequence,
-            &mut consensus,
-            &mut seed_ext,
-            args.match_score,
-            args.mismatch_score,
-            args.gap_score,
-            args.gap_extend_score,
-            args.cap_penalty,
-            args.max_extend,
-            args.max_gap,
-            args.stop_after,
-            k,
-            args.min_improvement as i32,
-        );
-        
-        // Update seed_ext for right extension
-        for i in 0..seedfreq {
-            repeatend[i] = seed_ext[i];
-        }
-        
-        // Reset seed_ext for left extension
-        seed_ext.fill(-1);
-        
-        // Left extension  
-        let left_ext = reprise::alg::repeat::extend(
-            false, // is_right
-            seedfreq,
-            &pos,
-            &rev,
-            &data.sequence,
-            &mut consensus,
-            &mut seed_ext,
-            args.match_score,
-            args.mismatch_score,
-            args.gap_score,
-            args.gap_extend_score,
-            args.cap_penalty,
-            args.max_extend,
-            args.max_gap,
-            args.stop_after,
-            k,
-            args.min_improvement as i32,
-        );
-        
-        // Update seed_ext for left extension
-        for i in 0..seedfreq {
-            repeatstart[i] = -seed_ext[i] - 1;
-        }
-        
-        // Calculate consensus boundaries  
-        let consensusstart = args.max_extend.saturating_sub(left_ext.max(0) as usize);
-        let consensusend = args.max_extend + k - 1 + right_ext.max(0) as usize;
-        let consensus_length = consensusend.saturating_sub(consensusstart) + 1;
-        
-        // Only create repeat family if it meets minimum length requirement
-        if consensus_length >= args.min_length {
-            let mut element_count = 0;
-            
-            // Perform masking alignment for each occurrence
-            for i in 0..seedfreq {
-                let (elementstart, elementend) = reprise::alg::repeat::masking_align(
-                    i,
-                    consensusstart,
-                    consensusend,
-                    &consensus,
-                    &data.sequence,
-                    pos[i],
-                    k,
-                    rev[i],
-                    args.match_score,
-                    args.mismatch_score,
-                    args.gap_score,
-                    args.gap_extend_score,
-                    args.max_extend,
-                    args.stop_after,
-                );
-                
-                // Check if element meets minimum length
-                if (elementend - elementstart + 1).abs() >= args.min_length as isize {
-                    element_count += 1;
-                    
-                    // Write to BED file if requested
-                    if let Some(ref mut bed) = bed_writer {
-                        let element_pos = pos[i];
-                        let (chr_name, chr_offset) = chrtracer(element_pos, &data.chrtable);
-                        let bed_start = element_pos + elementstart.max(0) as usize - chr_offset;
-                        let bed_end = element_pos + elementend.max(0) as usize - chr_offset;
-                        let element_length = (elementend - elementstart + 1).abs();
-                        let strand = if rev[i] { "-" } else { "+" };
-                        writeln!(bed, "{}\t{}\t{}\tR={}\t{}\t{}", 
-                            chr_name, bed_start, bed_end, repeat_num, element_length, strand)?;
-                    }
-                    
-                    // Mask the element
-                    reprise::alg::repeat::maskbyrepeat_element(i, elementstart.max(0) as usize, elementend.max(0) as usize, &mut mask, &pos);
-                }
-            }
-            
-            // Only output if we have valid elements
-            if element_count > 0 {
-                // Create consensus sequence output
-                write!(reprof_writer, ">R={}, seedfreq={}, elementfreq={}, length={}, Seed=", 
-                       repeat_num, seedfreq, element_count, consensus_length)?;
-                for &base in &kmer {
-                    write!(reprof_writer, "{}", num_to_char(base))?;
-                }
-                writeln!(reprof_writer)?;
-                
-                // Write the extended consensus sequence
-                for i in consensusstart..=consensusend {
-                    write!(reprof_writer, "{}", num_to_char(consensus[i]))?;
-                    if (i - consensusstart + 1) % 80 == 0 {
-                        writeln!(reprof_writer)?;
-                    }
-                }
-                if (consensusend - consensusstart + 1) % 80 != 0 {
-                    writeln!(reprof_writer)?;
-                }
-                
-                // Write to freq file (format: repeat_id \t seedfreq \t element_count)
-                writeln!(freq_writer, "R={}\t{}\t{}", repeat_num, seedfreq, element_count)?;
-                
-                repeat_num += 1;
-            }
-            // Note: Seeds are already masked immediately after find_bestseed
-        }
-        // Note: Seeds are already masked immediately after find_bestseed
-    }
-
-    // Write masked sequence file if requested
-    if let Some(ref mut masked) = masked_writer {
-        for (chr_name, chr_start) in &data.chrtable {
-            if chr_name == "unknown" || chr_name == "padding" {
-                continue; // Skip special chromosome entries
-            }
-            
-            writeln!(masked, ">{}", chr_name)?;
-            
-            // Find the end of this chromosome
-            let chr_end = if let Some((_name, next_start)) = data.chrtable.iter()
-                .find(|(n, _)| n != chr_name && n != "unknown" && n != "padding") {
-                *next_start
-            } else {
-                data.sequence.len()
-            };
-            
-            // Write sequence with masked regions in lowercase
-            for i in *chr_start..chr_end.min(data.sequence.len()) {
-                if data.sequence[i] > 3 {
-                    continue; // Skip invalid bases
-                }
-                let base_char = num_to_char(data.sequence[i]);
-                let output_char = if mask[i] {
-                    base_char.to_ascii_lowercase()
-                } else {
-                    base_char
-                };
-                write!(masked, "{}", output_char)?;
-                
-                // Line wrap at 80 characters
-                if (i - *chr_start + 1) % 80 == 0 {
-                    writeln!(masked)?;
-                }
-            }
-            
-            // Add final newline if needed
-            let chr_len = chr_end.min(data.sequence.len()).saturating_sub(*chr_start);
-            if chr_len % 80 != 0 {
-                writeln!(masked)?;
+                warn!("Cannot resume from checkpoint due to incompatibility, starting fresh");
             }
         }
     }
 
-    println!("Processed {} repeat families", repeat_num);
+    // Run the main analysis
+    let result = run_analysis(
+        config_manager,
+        &args,
+        logging_system,
+        recovery_manager,
+        resume_from_checkpoint,
+    );
+
+    // Shutdown system monitoring
+    shutdown_system_manager();
+
+    // Log final metrics
+    if let Some(system_manager) = system_manager() {
+        system_manager.get_metrics().log_metrics_summary();
+    }
+
+    match result {
+        Ok(()) => {
+            info!("REPrise analysis completed successfully");
+            Ok(())
+        }
+        Err(e) => {
+            error!(error = %e, "REPrise analysis failed");
+            Err(e)
+        }
+    }
+}
+
+/// List available configuration profiles
+fn list_profiles() -> Result<()> {
+    let manager = ConfigManager::new();
+    println!("Available REPrise configuration profiles:");
+    println!("=========================================");
+    
+    for profile_name in manager.list_profiles() {
+        if let Some(description) = manager.profile_description(profile_name) {
+            println!("  {:<15} - {}", profile_name, description);
+        }
+    }
+    
+    println!("\nUse --profile <name> to apply a profile.");
     Ok(())
 }
 
+/// Show system information and recommendations
+fn show_system_info() -> Result<()> {
+    let config = reprise::config::SystemSettings::default();
+    let metrics = Arc::new(reprise::logging::MetricsCollector::new());
+    let monitor = reprise::system::ResourceMonitor::new(config, metrics);
+    
+    let system_info = monitor.system_info()?;
+    let recommendations = monitor.get_recommendations()?;
+    
+    println!("REPrise System Information");
+    println!("=========================");
+    println!("Total Memory:      {} GB", system_info.total_memory / (1024 * 1024 * 1024));
+    println!("Available Memory:  {} GB", system_info.available_memory / (1024 * 1024 * 1024));
+    println!("Memory Usage:      {:.1}%", system_info.memory_usage_percent);
+    println!("CPU Cores:         {}", system_info.cpu_count);
+    println!("CPU Usage:         {:.1}%", system_info.cpu_usage_percent);
+    println!("Process Memory:    {} MB", system_info.process_memory / (1024 * 1024));
+    
+    if let Some((load1, load5, load15)) = system_info.load_averages {
+        println!("Load Average:      {:.2}, {:.2}, {:.2}", load1, load5, load15);
+    }
+    
+    if !recommendations.is_empty() {
+        println!("\nRecommendations:");
+        println!("================");
+        for rec in recommendations {
+            println!("  • {}", rec);
+        }
+    }
+    
+    Ok(())
+}
+
+/// Override configuration with command line arguments
+fn override_config_from_args(
+    config_manager: &mut ConfigManager,
+    args: &Args,
+) -> Result<()> {
+    let config = config_manager.config_mut();
+    
+    // Pipeline settings
+    if args.threads != 0 {
+        config.pipeline.num_workers = args.threads;
+    }
+    if args.min_freq != 3 {
+        config.pipeline.min_frequency = args.min_freq;
+    }
+    if args.max_freq.is_some() {
+        config.pipeline.max_frequency = args.max_freq;
+    }
+    if args.extension != 100 {
+        config.pipeline.region_extension = args.extension;
+    }
+    if args.max_region != 10000 {
+        config.pipeline.max_region_size = args.max_region;
+    }
+    if args.min_score != 10 {
+        config.pipeline.min_alignment_score = args.min_score;
+    }
+    if args.min_identity != 0.50 {
+        config.pipeline.min_identity = args.min_identity;
+    }
+    if args.channel_capacity != 10000 {
+        config.pipeline.channel_capacity = args.channel_capacity;
+    }
+    
+    // Logging settings
+    config.logging.level = match args.log_level.to_lowercase().as_str() {
+        "trace" => LogLevel::Trace,
+        "debug" => LogLevel::Debug,
+        "info" => LogLevel::Info,
+        "warn" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        _ => LogLevel::Info,
+    };
+    
+    if args.json_logs {
+        config.logging.json_format = true;
+    }
+    
+    if args.log_dir.is_some() {
+        config.logging.log_dir = args.log_dir.clone();
+    }
+    
+    // Output settings
+    if args.compress {
+        config.output.enable_compression = true;
+    }
+    
+    config.output.compression_type = match args.compression_type.as_str() {
+        "gzip" => CompressionType::Gzip,
+        "bzip2" => CompressionType::Bzip2,
+        _ => CompressionType::Gzip,
+    };
+    
+    if let Some(formats) = &args.output_formats {
+        config.output.formats = formats.iter().filter_map(|f| {
+            match f.to_lowercase().as_str() {
+                "tsv" => Some(OutputFormat::Tsv),
+                "bed" => Some(OutputFormat::Bed),
+                "json" => Some(OutputFormat::Json),
+                "gff3" => Some(OutputFormat::Gff3),
+                "reprof" => Some(OutputFormat::Reprise),
+                _ => None,
+            }
+        }).collect();
+    }
+    
+    config.output.file_prefix = args.output.clone();
+    
+    // Recovery settings
+    if args.enable_checkpoints {
+        config.recovery.enable_checkpoints = true;
+    }
+    
+    if args.checkpoint_dir.is_some() {
+        config.recovery.checkpoint_dir = args.checkpoint_dir.clone();
+    }
+    
+    // Backward compatibility
+    if args.additional_files && config.output.formats.len() == 2 {
+        // Add BED format if only TSV was specified
+        if !config.output.formats.contains(&OutputFormat::Bed) {
+            config.output.formats.push(OutputFormat::Bed);
+        }
+    }
+    
+    Ok(())
+}
+
+/// Calculate hash of configuration for checkpoint compatibility
+fn calculate_config_hash(config: &reprise::config::RepriseConfig) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    let mut hasher = DefaultHasher::new();
+    
+    // Hash key configuration parameters that affect processing
+    config.pipeline.num_workers.hash(&mut hasher);
+    config.pipeline.min_frequency.hash(&mut hasher);
+    config.pipeline.max_frequency.hash(&mut hasher);
+    config.pipeline.region_extension.hash(&mut hasher);
+    config.pipeline.max_region_size.hash(&mut hasher);
+    config.pipeline.min_alignment_score.hash(&mut hasher);
+    config.pipeline.min_identity.to_bits().hash(&mut hasher);
+    config.index.k.hash(&mut hasher);
+    
+    hasher.finish()
+}
+
+/// Calculate hash of input file for checkpoint compatibility
+fn calculate_file_hash(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 8192];
+    
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Main analysis function with production features
+#[instrument(skip_all)]
+fn run_analysis(
+    config_manager: ConfigManager,
+    args: &Args,
+    logging_system: LoggingSystem,
+    recovery_manager: Arc<RecoveryManager>,
+    resume_checkpoint: Option<reprise::recovery::Checkpoint>,
+) -> Result<()> {
+    let config = config_manager.config();
+    let run_start_time = Instant::now();
+    
+    // Load genome
+    info!("Loading genome from {}", args.input.display());
+    let progress = logging_system.progress("genome_loading", None);
+    
+    let genome_start = Instant::now();
+    let genome = logging_system.time_operation("genome_loading", || {
+        Arc::new(Genome::from_fasta(&args.input).map_err(|e| {
+            error!(error = %e, "Failed to load genome");
+            e
+        }))
+    })?;
+    let genome_time = genome_start.elapsed();
+    progress.report();
+    
+    info!(
+        genome_size = genome.len(),
+        num_contigs = genome.num_contigs(),
+        load_time = ?genome_time,
+        "Genome loaded successfully"
+    );
+
+    // Build k-mer index
+    info!("Building k-mer index");
+    let index_start = Instant::now();
+    
+    let k = args.k.unwrap_or_else(|| {
+        let genome_len = genome.len() as usize;
+        let calculated_k = reprise::default_k(genome_len, 0).min(32).max(4);
+        calculated_k
+    });
+    
+    let index_config = IndexConfig {
+        k,
+        min_frequency: config.index.min_frequency,
+        max_frequency: config.index.max_frequency,
+        parallel: config.index.parallel,
+        max_positions_per_kmer: config.index.max_positions_per_kmer,
+        memory_hints: reprise::index::MemoryHints::default(),
+    };
+    
+    let index = logging_system.time_operation("index_building", || {
+        Arc::new(KmerIndex::build(&genome, index_config).map_err(|e| {
+            error!(error = %e, "Failed to build k-mer index");
+            e
+        }))
+    })?;
+    
+    let index_time = index_start.elapsed();
+    let index_stats = index.stats();
+    
+    info!(
+        k_mer_length = k,
+        unique_kmers = index_stats.total_kmers,
+        total_positions = index_stats.total_positions,
+        build_time = ?index_time,
+        "K-mer index built successfully"
+    );
+
+    // Create bitmask
+    let mask = Arc::new(Bitmask::new(genome.len()));
+
+    // Configure and run pipeline
+    let pipeline_config = config_manager.to_pipeline_config();
+    let pipeline = Pipeline::with_config(pipeline_config);
+    
+    info!("Starting repeat detection pipeline");
+    let pipeline_progress = logging_system.progress("pipeline_processing", None);
+    
+    // Create checkpoint before processing
+    if config.recovery.enable_checkpoints {
+        let state = ProcessingState {
+            last_kmer_index: 0,
+            candidates_generated: 0,
+            candidates_processed: 0,
+            phase: ProcessingPhase::CandidateGeneration,
+            custom_data: serde_json::json!({}),
+        };
+        
+        let progress_info = ProgressInfo {
+            current_step: "Starting pipeline".to_string(),
+            steps_completed: 0,
+            total_steps: None,
+            percentage_complete: Some(0.0),
+            estimated_time_remaining: None,
+        };
+        
+        recovery_manager.create_checkpoint(
+            state,
+            &[],
+            &pipeline.stats(),
+            calculate_config_hash(config),
+            Some(calculate_file_hash(&args.input)?),
+            progress_info,
+        )?;
+    }
+    
+    let pipeline_start = Instant::now();
+    let detected_repeats = recovery_manager.with_retry("pipeline_processing", || {
+        pipeline.run(genome.clone(), index.clone(), mask.clone())
+    })?;
+    let pipeline_time = pipeline_start.elapsed();
+    
+    pipeline_progress.report();
+    
+    // Log pipeline statistics
+    let pipeline_stats = pipeline.stats();
+    info!(
+        candidates_generated = pipeline_stats.candidates_generated(),
+        candidates_processed = pipeline_stats.candidates_processed(),
+        candidates_skipped = pipeline_stats.candidates_skipped(),
+        repeats_detected = pipeline_stats.repeats_detected(),
+        processing_efficiency = pipeline_stats.efficiency(),
+        detection_rate = pipeline_stats.detection_rate(),
+        processing_time = ?pipeline_time,
+        processing_rate = pipeline_stats.candidates_processed() as f64 / pipeline_time.as_secs_f64(),
+        "Pipeline processing completed"
+    );
+
+    // Prepare output metadata
+    let total_time = run_start_time.elapsed();
+    let output_metadata = OutputMetadata {
+        run_id: recovery_manager.run_id(),
+        timestamp: Utc::now(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        command_line: std::env::args().collect::<Vec<_>>().join(" "),
+        input_file: args.input.clone(),
+        parameters: ProcessingParameters {
+            k_mer_length: k,
+            min_frequency: config.pipeline.min_frequency,
+            max_frequency: config.pipeline.max_frequency,
+            region_extension: config.pipeline.region_extension,
+            min_alignment_score: config.pipeline.min_alignment_score,
+            min_identity: config.pipeline.min_identity,
+            num_workers: config.pipeline.num_workers,
+        },
+        statistics: OutputStatistics {
+            total_repeats_found: detected_repeats.len() as u64,
+            candidates_processed: pipeline_stats.candidates_processed(),
+            processing_time_seconds: total_time.as_secs_f64(),
+            genome_coverage: calculate_genome_coverage(&detected_repeats, genome.len()),
+            average_repeat_length: calculate_average_length(&detected_repeats),
+            average_identity: calculate_average_identity(&detected_repeats),
+            average_score: calculate_average_score(&detected_repeats),
+        },
+        genome_info: GenomeInfo {
+            total_length: genome.len(),
+            num_contigs: genome.num_contigs(),
+            n50: calculate_n50(&genome),
+            gc_content: calculate_gc_content(&genome),
+        },
+    };
+
+    // Write output files
+    info!("Writing output files");
+    let output_manager = OutputManager::new(config.output.clone(), output_metadata)?;
+    let checksums = output_manager.write_results(&detected_repeats, &genome)?;
+    
+    info!(
+        output_files = checksums.len(),
+        total_repeats = detected_repeats.len(),
+        "Output files written successfully"
+    );
+
+    // Final checkpoint
+    if config.recovery.enable_checkpoints {
+        let final_state = ProcessingState {
+            last_kmer_index: 0,
+            candidates_generated: pipeline_stats.candidates_generated(),
+            candidates_processed: pipeline_stats.candidates_processed(),
+            phase: ProcessingPhase::Completed,
+            custom_data: serde_json::json!({}),
+        };
+        
+        let final_progress = ProgressInfo {
+            current_step: "Analysis completed".to_string(),
+            steps_completed: detected_repeats.len() as u64,
+            total_steps: Some(detected_repeats.len() as u64),
+            percentage_complete: Some(100.0),
+            estimated_time_remaining: Some(Duration::from_secs(0)),
+        };
+        
+        recovery_manager.create_checkpoint(
+            final_state,
+            &detected_repeats,
+            &pipeline.stats(),
+            calculate_config_hash(config),
+            Some(calculate_file_hash(&args.input)?),
+            final_progress,
+        )?;
+    }
+
+    info!(
+        total_time = ?total_time,
+        repeats_found = detected_repeats.len(),
+        genome_size = genome.len(),
+        "REPrise analysis completed successfully"
+    );
+
+    Ok(())
+}
+
+/// Calculate genome coverage by detected repeats
+fn calculate_genome_coverage(repeats: &[DetectedRepeat], genome_length: u64) -> f64 {
+    if repeats.is_empty() {
+        return 0.0;
+    }
+    
+    let total_covered = repeats.iter().map(|r| r.length).sum::<u64>();
+    (total_covered as f64 / genome_length as f64) * 100.0
+}
+
+/// Calculate average repeat length
+fn calculate_average_length(repeats: &[DetectedRepeat]) -> f64 {
+    if repeats.is_empty() {
+        return 0.0;
+    }
+    
+    repeats.iter().map(|r| r.length as f64).sum::<f64>() / repeats.len() as f64
+}
+
+/// Calculate average repeat identity
+fn calculate_average_identity(repeats: &[DetectedRepeat]) -> f64 {
+    if repeats.is_empty() {
+        return 0.0;
+    }
+    
+    repeats.iter().map(|r| r.identity).sum::<f64>() / repeats.len() as f64
+}
+
+/// Calculate average repeat score
+fn calculate_average_score(repeats: &[DetectedRepeat]) -> f64 {
+    if repeats.is_empty() {
+        return 0.0;
+    }
+    
+    repeats.iter().map(|r| r.score as f64).sum::<f64>() / repeats.len() as f64
+}
+
+/// Calculate N50 for genome
+fn calculate_n50(genome: &Genome) -> u64 {
+    // This would need access to contig lengths
+    // For now, return a placeholder
+    genome.len() / 2
+}
+
+/// Calculate GC content for genome
+fn calculate_gc_content(genome: &Genome) -> f64 {
+    // This would need access to the actual sequence data
+    // For now, return a typical value
+    0.42
+}

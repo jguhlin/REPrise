@@ -1,0 +1,19 @@
+{
+  "cpp": {
+    "masking_align": [
+      {"i":0,"consensusstart":5,"consensusend":15,"result":[8,12]},
+      {"i":1,"consensusstart":0,"consensusend":4,"result":[0,4]},
+      {"i":2,"consensusstart":10,"consensusend":10,"result":[8,10]}
+    ],
+    "chrtracer": [
+      {"pos":11010,"chr":"padding","off":11000},
+      {"pos":22100,"chr":"tstA","off":22000},
+      {"pos":11000,"chr":"padding","off":11000}
+    ],
+    "mask_extention_score": [
+      {"is_right":true,"ext":10,"i":0,"band":5,"score":5},
+      {"is_right":true,"ext":0,"i":1,"band":7,"score":7},
+      {"is_right":false,"ext":3,"i":2,"band":9,"score":9}
+    ]
+  }
+}

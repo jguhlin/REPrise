@@ -99,6 +99,11 @@ impl RepriseError {
     pub fn parse(message: impl Into<String>) -> Self {
         Self::Parse(message.into())
     }
+    
+    /// Create an I/O error
+    pub fn io_error(message: impl Into<String>) -> Self {
+        Self::Io(std::io::Error::new(std::io::ErrorKind::Other, message.into()))
+    }
 }
 
 /// Result type alias for REPrise operations

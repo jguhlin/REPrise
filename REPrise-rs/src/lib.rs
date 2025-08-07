@@ -5,9 +5,21 @@ compile_error!("REPrise requires a 64-bit target to handle large genomes.");
 pub mod alg;
 pub mod mask;
 pub mod error;
+pub mod quality;
+pub mod quality_integration_example;
 pub mod genome;
 pub mod kmer;
 pub mod index;
+pub mod pipeline;
+pub mod memory_pool;
+pub mod alignment;
+
+// Production-grade modules (temporarily disabled for core testing)
+// pub mod config;
+// pub mod logging;
+// pub mod output;
+// pub mod recovery;
+// pub mod system;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
