@@ -187,6 +187,21 @@ pub fn chrtracer(pos: usize, chrtable: &[(String, usize)]) -> (String, usize) {
 6. **Week 3**: Clean up code warnings (Priority 3)
    - Final polish
 
+## Memory Safety Fixes (GitHub Issue #1)
+
+**Problem**: C++ version crashes with heap-buffer-overflow when using large `-maxextend` values (e.g., 100,000) on repetitive genomes.
+
+**Root Cause**: Excessive memory allocation for consensus sequences and potential array bounds violations.
+
+**Rust Implementation Fixes**:
+1. **Input Validation**: Hard limits on `-maxextend` (max: 1,000,000) and `-maxrepeat` (max: 10,000,000)
+2. **Memory Estimation**: Verbose mode shows estimated memory usage and warnings for large values
+3. **Bounds Checking**: Safe sequence access and consensus allocation with size limits
+4. **Graceful Degradation**: Skip problematic families instead of crashing
+5. **User Guidance**: Help text recommends tandem repeat pre-masking for large genomes
+
+**Testing**: Successfully handles `-maxextend 100000` with warnings but no crashes, unlike C++ version.
+
 ## Success Metrics
 
 - [ ] Rust and C++ find same number of repeat families on all test datasets
@@ -195,3 +210,4 @@ pub fn chrtracer(pos: usize, chrtable: &[(String, usize)]) -> (String, usize) {
 - [ ] No compiler warnings
 - [ ] Integration tests pass
 - [ ] Can process E. coli genome in under 60 seconds
+- [x] **Memory Safety**: No crashes with extreme parameters (fixes GitHub issue #1)

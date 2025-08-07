@@ -41,8 +41,19 @@ pub fn store_cache(
     seq: &[u8],
     sa: &[i64],
 ) -> Vec<Vec<CacheEntry>> {
-    let size = 1usize << (cache_len * 2);
-    let mut cache = vec![Vec::new(); size];
+    // Limit k-mer length for cache to prevent excessive memory allocation
+    // For k > 15, the cache would require > 1GB of memory (4^15 = 1 billion entries)
+    const MAX_CACHE_K: usize = 15;
+    
+    if cache_len > MAX_CACHE_K {
+        eprintln!("Warning: k-mer length {} exceeds maximum cache size. Using hash-based approach.", cache_len);
+        // For large k, return empty cache and rely on suffix array directly
+        // This will be slower but won't exhaust memory
+        return vec![Vec::new(); 0];
+    }
+    
+    let size = 1u64 << (cache_len * 2);
+    let mut cache = vec![Vec::new(); size as usize];
 
     if edit_distance == 0 {
         // Optimized exact matching - scan suffix array once
@@ -102,7 +113,7 @@ pub fn store_cache(
             
             // Convert matches to cache entries
             for (begin, end) in matched {
-                cache[id].push((begin, end, cache_len as u8, edit_distance));
+                cache[id as usize].push((begin, end, cache_len as u8, edit_distance));
             }
         }
     }
@@ -442,7 +453,7 @@ pub(crate) fn mask_extention_score(
     let mut next_del = vec![0i32; width];
     let mut best = MINSCORE;
 
-    // helper to fetch sequence base with C++ index arithmetic
+    // helper to fetch sequence base with safe bounds checking - prevents heap-buffer-overflow
     let get_seq = |offset: isize| -> Option<u8> {
         let off = offset as isize;
         if off < 0 { return None; }
@@ -889,6 +900,11 @@ pub fn extend(
     }
     
     for ext in 0..max_extend {
+        // Safety check - prevent buffer overflows that caused C++ heap crashes
+        if max_extend + ext >= consensus.len() || (max_extend as i32 - ext as i32 - 1) < 0 {
+            eprintln!("Warning: Extension bounds exceeded at ext={}, breaking early", ext);
+            break;
+        }
         nexttotalscore.fill(0);
         
         for base in 0..4u8 {

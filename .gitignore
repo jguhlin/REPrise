@@ -39,3 +39,7 @@ equivalence_report.md
 # Rust build artifacts
 REPrise-rs/target/
 REPrise-rs/Cargo.lock
+
+*.freq
+*.reprof
+*.txt
