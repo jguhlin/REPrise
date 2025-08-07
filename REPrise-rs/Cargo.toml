@@ -75,17 +75,19 @@ loom = "0.7"
 # Temporary files for testing
 tempfile = "3.0"
 
-[[bin]]
-name = "REPrise-optimized"
-path = "src/main_optimized.rs"
+# Legacy binaries disabled to fix compilation - use main REPrise-rs binary with --streaming flag
+# [[bin]]
+# name = "REPrise-optimized" 
+# path = "src/main_optimized.rs"
 
 [[bin]]
 name = "reprise-cpp-port"
 path = "src/bin/reprise_cpp_port.rs"
 
-[[bin]]
-name = "reprise-streaming"
-path = "src/bin/reprise_streaming.rs"
+# Streaming functionality now integrated into main binary
+# [[bin]]
+# name = "reprise-streaming"
+# path = "src/bin/reprise_streaming.rs"
 
 [features]
 default = []
